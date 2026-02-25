@@ -1,0 +1,27 @@
+{
+  "name": "esp-https-client-async",
+  "version": "0.0.1b",
+  "keywords": "wifi,wi-fi,esp,esp32,espressif32,nodemcu,wemos,arduino",
+  "description": "Async HTTPS client for the ESP32.",
+  "frameworks": [
+    "arduino"
+  ],
+  "repository":
+  {
+    "type": "git",
+    "url": "https://github.com/davirxavier/esp-https-client-async.git"
+  },
+  "authors":
+  [
+    {
+      "name": "D. Xavier",
+      "email": "fdavirxxavier@gmail.com",
+      "maintainer": true
+    }
+  ],
+  "license": "MIT",
+  "platforms":
+  [
+    "esp32"
+  ]
+}
