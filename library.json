@@ -1,15 +1,15 @@
 {
-  "name": "esp-https-client-async",
+  "name": "esp-httpx-client",
   "version": "0.0.1b",
   "keywords": "wifi,wi-fi,esp,esp32,espressif32,nodemcu,wemos,arduino",
-  "description": "Async HTTPS client for the ESP32.",
+  "description": "Async HTTP and HTTPS client for the ESP32. Uses the esp_tls library.",
   "frameworks": [
     "arduino"
   ],
   "repository":
   {
     "type": "git",
-    "url": "https://github.com/davirxavier/esp-https-client-async.git"
+    "url": "https://github.com/davirxavier/esp-httpx-client.git"
   },
   "authors":
   [

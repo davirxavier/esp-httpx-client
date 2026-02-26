@@ -8,45 +8,45 @@
 #include <esp_tls.h>
 #include <esp_crt_bundle.h>
 
-#define EHTTPSCA_CLIENT_TIMEOUT (-0x1)
+#define ESP_HTTPX_CLIENT_TIMEOUT (-0x1)
 
-#ifdef EHTTPSCA_ENABLE_LOGGING
-#define EHTTPSCA_LOG(str) Serial.print(str)
-#define EHTTPSCA_LOGW(str, len) Serial.write(str, len)
-#define EHTTPSCA_LOGN(str) Serial.print("[EHTTPSCA] "); Serial.println(str)
-#define EHTTPSCA_LOGF(str, p...) Serial.print("[EHTTPSCA] "); Serial.printf(str, p)
+#ifdef ESP_HTTPX_ENABLE_LOGGING
+#define ESP_HTTPX_LOG(str) Serial.print(str)
+#define ESP_HTTPX_LOGW(str, len) Serial.write(str, len)
+#define ESP_HTTPX_LOGN(str) Serial.print("[ESP-HTTPX-CLIENT] "); Serial.println(str)
+#define ESP_HTTPX_LOGF(str, p...) Serial.print("[ESP-HTTPX-CLIENT] "); Serial.printf(str, p)
 #else
-#define HTTP_LOG(str)
-#define HTTP_LOGW(str, len)
-#define HTTP_LOGN(str)
-#define HTTP_LOGF(str, p...)
+#define ESP_HTTPX_LOG(str)
+#define ESP_HTTPX_LOGW(str, len)
+#define ESP_HTTPX_LOGN(str)
+#define ESP_HTTPX_LOGF(str, p...)
 #endif
 
-#define EHTTPSCA_WRITE_CHECK(data, len, retval, counter)   \
+#define ESP_HTTPX_WRITE_CHECK(data, len, retval, counter)   \
         ssize_t _res##counter = 0;                     \
         do {                                           \
             _res##counter = writeWithTimeout(data, len); \
-            EHTTPSCA_LOGW((const char*) data, len);     \
+            ESP_HTTPX_LOGW((const char*) data, len);     \
             if (_res##counter < 0) {                   \
-                EHTTPSCA_LOGF("Write error: 0x%x\n", -(int)_res##counter); \
+                ESP_HTTPX_LOGF("Write error: 0x%x\n", -(int)_res##counter); \
                 return retval;                         \
             }                                          \
         } while(false)
 
-#define EHTTPSCA_WRITE_CHECK_VOID(data, len, counter)      \
+#define ESP_HTTPX_WRITE_CHECK_VOID(data, len, counter)      \
         do {                                           \
             ssize_t _res##counter = writeWithTimeout(data, len); \
-            EHTTPSCA_LOGW((const char*) data, len);     \
+            ESP_HTTPX_LOGW((const char*) data, len);     \
             if (_res##counter < 0) {                   \
-                EHTTPSCA_LOGF("Write error: 0x%x\n", -(int)_res##counter); \
+                ESP_HTTPX_LOGF("Write error: 0x%x\n", -(int)_res##counter); \
                 return;                                \
             }                                          \
         } while(false)
 
-#define EHTTPSCA_WRITE_BOTH(str) EHTTPSCA_WRITE_CHECK_VOID((const uint8_t*) (str), strlen(str), 0)
-#define EHTTPSCA_WRITE_LN_CHECK_VOID() EHTTPSCA_WRITE_CHECK_VOID((const uint8_t*) LINE_FEED, LINE_FEED_LEN, 0)
+#define ESP_HTTPX_WRITE_BOTH(str) ESP_HTTPX_WRITE_CHECK_VOID((const uint8_t*) (str), strlen(str), 0)
+#define ESP_HTTPX_WRITE_LN_CHECK_VOID() ESP_HTTPX_WRITE_CHECK_VOID((const uint8_t*) LINE_FEED, LINE_FEED_LEN, 0)
 
-namespace EHTTPSCA
+namespace ESP_HTTPX_CLIENT
 {
     typedef enum {
         STR2INT_SUCCESS,
@@ -140,7 +140,7 @@ namespace EHTTPSCA
         return true;
     }
 
-    enum ESPHttpsClientAsyncState
+    enum ESPHttpxClientState
     {
         STOPPED = 0,
         CONNECTING,
@@ -154,15 +154,26 @@ namespace EHTTPSCA
         READING_CHUNK_DATA_CRLF,
     };
 
-    enum ESPHttpsClientAsyncEvent
+    enum ESPHttpxClientEvent
     {
         CONNECTION_SUCCESSFUL_EVENT,
         CONNECTION_FAILED_EVENT,
+        ERROR_EVENT,
         WRITE_BODY_EVENT,
         STATUS_RECEIVED_EVENT,
         HEADER_RECEIVED_EVENT,
         DATA_EVENT,
         REQUEST_FINISHED_EVENT,
+    };
+
+    enum ESPHttpxClientError
+    {
+        MALFORMED_STATUS_LINE = 0,
+        MALFORMED_CHUNK_SIZE,
+        INVALID_CHUNK_FORMAT,
+        WRITE_TIMEOUT,
+        TOO_MANY_REDIRECTS,
+        INVALID_REDIRECT,
     };
 
     static const char* HTTP_VER PROGMEM = " HTTP/1.1";
@@ -191,23 +202,44 @@ namespace EHTTPSCA
     static const char LINE_FEED[] PROGMEM = "\r\n";
     static constexpr size_t LINE_FEED_LEN = 2;
 
-    using ESPHttpsClientAsyncEventHandler = std::function<void(ESPHttpsClientAsyncEvent event, uint8_t *data, size_t len, bool headerTruncated)>;
+    using ESPHttpxClientEventHandler = std::function<void(ESPHttpxClientEvent event, uint8_t *data, size_t len, bool headerTruncated)>;
+    using ESPHttpxClientWriteHandler = std::function<bool(uint8_t *buffer, size_t bufferSize, size_t index, bool next)>;
 
-    template <size_t totalDataSize, size_t headerBufferSize, size_t maxHostnameLen = 128, size_t maxPathLen = 256>
-    class ESPHttpsClientAsync
+    /**
+     * Flash size note:
+     *
+     * Each unique template parameter combination generates a new copy of codethis class. On ESP32 (ESP-IDF, -Os), this
+     * typically increases flash usage by ~700 bytes per unique configuration.
+     *
+     * Avoid creating many different size variations unless necessary.
+     *
+     * @tparam dataBufferSize    Size of the internal general data buffer.
+     * @tparam headerBufferSize  Size of the response header buffer. This determines
+     *                           the maximum header line length delivered in the
+     *                           HEADER_RECEIVED_EVENT.
+     * @tparam maxHostnameLen    Maximum hostname length (including null terminator).
+     * @tparam maxPathLen        Maximum request path length (including null terminator).
+     */
+    template <size_t dataBufferSize = 512, size_t headerBufferSize = 256, size_t maxHostnameLen = 128, size_t maxPathLen = 256>
+    class ESPHttpxClient
     {
-    public:
-        ESPHttpsClientAsync(const ESPHttpsClientAsync&) = delete;
-        ESPHttpsClientAsync& operator=(const ESPHttpsClientAsync&) = delete;
+        static_assert(dataBufferSize > 0, "dataBufferSize must be > 0");
+        static_assert(headerBufferSize > 0, "headerBufferSize must be > 0");
+        static_assert(maxHostnameLen > 0, "maxHostnameLen must be > 0");
+        static_assert(maxPathLen > 0, "maxPathLen must be > 0");
 
-        explicit ESPHttpsClientAsync(): path{}, hostname{}, dataBuffer{}, currentHeaderBuffer{}
+    public:
+        ESPHttpxClient(const ESPHttpxClient&) = delete;
+        ESPHttpxClient& operator=(const ESPHttpxClient&) = delete;
+
+        explicit ESPHttpxClient(): path{}, hostname{}, dataBuffer{}, currentHeaderBuffer{}
         {
             currentMethod = HTTP_GET;
             keepAlive = false;
             sentPath = false;
             pathLen = 0;
             hostnameLen = 0;
-            currentState = STOPPED;
+            setState(STOPPED);
             eventHandler = nullptr;
             handle = nullptr;
             cert = nullptr;
@@ -231,28 +263,57 @@ namespace EHTTPSCA
             }
         }
 
-        ~ESPHttpsClientAsync()
+        ~ESPHttpxClient()
         {
             cleanup();
         }
 
-        void setCertPem(const char *cert)
+        void setMaxRedirections(size_t max)
+        {
+            this->maxRedirections = max;
+        }
+
+        /**
+         * Certificate for the server. Will use this instead of the global_ca_store.
+         * @param cert Certificate buffer. Should include the null terminator if in PEM format.
+         * @param len Certificate length. Should include the null terminator if in PEM format.
+         */
+        void setCert(const char *cert, size_t len)
         {
             this->cert = cert;
-            this->certLen = strlen(cert) + 1;
+            this->certLen = len;
         }
 
+        /**
+         * Sets the client connection hostname. Max length is defined by maxHostnameLen template parameter;
+         */
         void setHostname(const char *host)
         {
-            snprintf(this->hostname, maxHostnameLen, "%s", host);
-            hostnameLen = strlen(hostname);
+            setHostname(host, strlen(host));
         }
 
+        /**
+         * Sets the client connection hostname. Max length is defined by maxHostnameLen template parameter;
+         */
+        void setHostname(const char *host, size_t len)
+        {
+            size_t finalLen = min(len, maxHostnameLen-1);
+            memcpy(this->hostname, host, finalLen);
+            this->hostname[finalLen] = 0;
+            hostnameLen = finalLen;
+        }
+
+        /**
+         * Sets the request path. Max length is defined by maxPathlen template parameter;
+         */
         void setPath(const char *path, Method method, bool keepAlive = false)
         {
             setPath(path, strlen(path), method, keepAlive);
         }
 
+        /**
+         * Sets the request path. Max length is defined by maxPathlen template parameter;
+         */
         void setPath(const char *path, size_t len, Method method, bool keepAlive = false)
         {
             currentMethod = method;
@@ -264,16 +325,27 @@ namespace EHTTPSCA
             pathLen = finalLen;
         }
 
+        /**
+         * Connection port;
+         * @param port desired port or -1 to use default ports
+         */
         void setPort(int port)
         {
             this->port = port;
         }
 
+        /**
+         * Sets the current client mode.
+         * @param mode PLAIN_HTTP, HTTPS_INSECURE or HTTPS_SECURE. Default is HTTPS_SECURE.
+         */
         void setMode(Mode mode)
         {
             this->mode = mode;
         }
 
+        /**
+         * Starts the HTTP request. Set the envent handler with onEvent before calling this.
+         */
         void start()
         {
             if (hostnameLen == 0)
@@ -283,7 +355,7 @@ namespace EHTTPSCA
 
             if (isTlsStarted())
             {
-                EHTTPSCA_LOGN("Tried to connect but connection already started.");
+                ESP_HTTPX_LOGN("Tried to connect but connection already started.");
                 return;
             }
 
@@ -303,59 +375,80 @@ namespace EHTTPSCA
                 config.crt_bundle_attach = esp_crt_bundle_attach;
             }
 
-            currentState = CONNECTING;
+            setState(CONNECTING);
         }
 
-        void sendHeader(const char *name, const char *value, bool endHeaders = false)
+        /**
+         * Sends a HTTP header. Call in the CONNECTION_SUCCESSFUL_EVENT callback passed to onEvent.
+         *
+         * @param name header name
+         * @param value header value
+         * @param endHeaders If true will end the headers section of the HTTP request. Set to true for the last header.
+         */
+        void sendHeader(const char *name, const char *value)
         {
-            EHTTPSCA_WRITE_BOTH(name);
-            EHTTPSCA_WRITE_BOTH(HEADER_SEPARATOR);
-            EHTTPSCA_WRITE_BOTH(value);
-            EHTTPSCA_WRITE_LN_CHECK_VOID();
-
-            if (endHeaders)
-            {
-                EHTTPSCA_WRITE_LN_CHECK_VOID();
-                callCb(WRITE_BODY_EVENT);
-            }
+            ESP_HTTPX_WRITE_BOTH(name);
+            ESP_HTTPX_WRITE_BOTH(HEADER_SEPARATOR);
+            ESP_HTTPX_WRITE_BOTH(value);
+            ESP_HTTPX_WRITE_LN_CHECK_VOID();
         }
 
-        void sendContentLength(ssize_t length, bool endHeaders = false)
+        /**
+         * Sends the request Content-Length header. Should always be called after all other desired headers have been sent.
+         * @param length Length of the content to be sent. Set to less than 0 to use chunked transfer.
+         */
+        void sendContentLength(ssize_t length)
         {
             contentLength = length;
 
             if (length >= 0)
             {
                 char numBuf[32]{};
-                snprintf(numBuf, sizeof(numBuf), "%zu", length);
-                sendHeader(CONTENT_LENGTH_HEADER, numBuf, endHeaders);
+                snprintf(numBuf, sizeof(numBuf), "%lu", length);
+                sendHeader(CONTENT_LENGTH_HEADER, numBuf);
 
                 if (length == 0)
                 {
-                    currentState = READING_STATUS;
+                    setState(READING_STATUS);
                 }
             }
             else
             {
-                sendHeader(TRANSFER_ENCODING_HEADER, CHUNKED_HEADER, endHeaders);
+                sendHeader(TRANSFER_ENCODING_HEADER, CHUNKED_HEADER);
             }
+
+            ESP_HTTPX_WRITE_LN_CHECK_VOID();
+            callCb(WRITE_BODY_EVENT);
         }
 
-        bool isSendingChunked()
+        bool isSendingChunked() const
         {
             return contentLength < 0;
         }
 
+        /**
+         * Writes a string to the request's body.
+         * @param data String to be written, has to be null terminated.
+         * @return If the write has succeeded or not.
+         */
         bool write(const char *data)
         {
             return write((uint8_t*) data, strlen(data));
         }
 
+        /**
+         * Writes data to the request body.
+         * @return If the write has succeeded or not.
+         */
         bool write(const char *data, size_t len)
         {
             return write((const uint8_t*) data, len);
         }
 
+        /**
+        * Writes data to the request body.
+        * @return If the write has succeeded or not.
+        */
         bool write(const uint8_t *data, size_t len)
         {
             if (currentState != SENDING_BODY)
@@ -367,33 +460,39 @@ namespace EHTTPSCA
             if (isChunked)
             {
                 char numBuf[32]{};
-                snprintf(numBuf, sizeof(numBuf), "%zx\r\n", len);
-                EHTTPSCA_WRITE_CHECK(numBuf, strlen(numBuf), false, 0);
+                snprintf(numBuf, sizeof(numBuf), "%lx\r\n", len);
+                ESP_HTTPX_WRITE_CHECK(numBuf, strlen(numBuf), false, 0);
             }
 
-            EHTTPSCA_WRITE_CHECK(data, len, false, 0);
+            ESP_HTTPX_WRITE_CHECK(data, len, false, 0);
             contentSentLen += len;
             if (isChunked)
             {
-                EHTTPSCA_WRITE_CHECK(LINE_FEED, LINE_FEED_LEN, false, 0);
+                ESP_HTTPX_WRITE_CHECK(LINE_FEED, LINE_FEED_LEN, false, 0);
             }
 
             if (!isChunked && contentSentLen >= contentLength)
             {
-                currentState = READING_STATUS;
+                setState(READING_STATUS);
             }
             return true;
         }
 
+        /**
+         * Must be called to end the writing of the body, if using chunked transfer (content-length < 0).
+         */
         void endChunkedBody()
         {
             if (isSendingChunked())
             {
-                EHTTPSCA_WRITE_CHECK_VOID(END_CHUNK_MARKER, END_CHUNK_MARKER_LEN, 0);
-                currentState = READING_STATUS;
+                ESP_HTTPX_WRITE_CHECK_VOID(END_CHUNK_MARKER, END_CHUNK_MARKER_LEN, 0);
+                setState(READING_STATUS);
             }
         }
 
+        /**
+         * Stop request and close connection.
+         */
         void close()
         {
             cleanup();
@@ -408,34 +507,36 @@ namespace EHTTPSCA
 
                 if (res == 1)
                 {
+                    ESP_HTTPX_LOGN("Connected succesfully.");
                     callCb(CONNECTION_SUCCESSFUL_EVENT);
                 }
                 else if (res == -1)
                 {
+                    ESP_HTTPX_LOGN("Connection failed.");
                     callCb(CONNECTION_FAILED_EVENT);
                 }
             }
 
             if (handle != nullptr && currentState > SENDING_BODY)
             {
-                ssize_t read = esp_tls_conn_read(handle, dataBuffer, totalDataSize);
+                ssize_t read = esp_tls_conn_read(handle, dataBuffer, dataBufferSize);
                 if (read == -0x004C) // Reading information from the socket failed
                 {
-                    EHTTPSCA_LOGN("Connection has been closed forcefully.");
-                    callCb(CONNECTION_FAILED_EVENT);
+                    ESP_HTTPX_LOGN("Connection has been closed forcefully.");
+                    callCb(REQUEST_FINISHED_EVENT);
                     return;
                 }
 
                 if (read == -0x50)
                 {
-                    EHTTPSCA_LOGN("Connection reset by peer.");
-                    callCb(CONNECTION_FAILED_EVENT);
+                    ESP_HTTPX_LOGN("Connection reset by peer.");
+                    callCb(REQUEST_FINISHED_EVENT);
                     return;
                 }
 
-                if (read < 0 && read != -0x6900 && (mode != PLAIN_HTTP || read != EHTTPSCA_CLIENT_TIMEOUT)) // No data of requested type currently available on underlying transport
+                if (read < 0 && read != -0x6900 && (mode != PLAIN_HTTP || read != ESP_HTTPX_CLIENT_TIMEOUT)) // No data of requested type currently available on underlying transport
                 {
-                    EHTTPSCA_LOGF("Error reading data from socket: 0x%x\n", -read);
+                    ESP_HTTPX_LOGF("Error reading data from socket: 0x%x\n", -read);
                     return;
                 }
 
@@ -448,39 +549,95 @@ namespace EHTTPSCA
                 while (start < read)
                 {
                     size_t remaining = read - start;
+                    uint8_t *startBuffer = dataBuffer + start;
 
                     switch (currentState)
                     {
                     case READING_STATUS:
                         {
-                            EHTTPSCA_LOGN("Searching for status code and message.");
-                            uint8_t *statusStart = (uint8_t*) memchr(dataBuffer+start, ' ', remaining);
-
-                            if (statusStart == nullptr)
+                            if (headerBufferOffset >= headerBufferSize - 1)
                             {
-                                EHTTPSCA_LOGN("Status code for request not found.");
-                                callCb(STATUS_RECEIVED_EVENT, (uint8_t*) "-1", 2);
+                                ESP_HTTPX_LOGN("Error parsing status line.");
+                                callError(MALFORMED_STATUS_LINE);
                                 return;
                             }
 
-                            size_t newLen = (statusStart - dataBuffer);
-                            if (newLen < 4)
+                            bool foundNewline = false;
+                            for (size_t i = 0; i < remaining; i++)
                             {
-                                EHTTPSCA_LOGN("Could not parse status code.");
-                                callCb(STATUS_RECEIVED_EVENT, (uint8_t*) "-1", 2);
+                                if (startBuffer[i] == '\n')
+                                {
+                                    if (headerBufferOffset > headerBufferSize)
+                                    {
+                                        headerBufferOffset = headerBufferSize;
+                                    }
+
+                                    if (headerBufferOffset < 2)
+                                    {
+                                        ESP_HTTPX_LOGN("Error parsing status line.");
+                                        callError(MALFORMED_STATUS_LINE);
+                                        return;
+                                    }
+
+                                    size_t nullPos = currentHeaderBuffer[headerBufferOffset-2] == '\r' ? headerBufferOffset-2 : headerBufferOffset-1;
+                                    if (nullPos >= headerBufferSize) // underflow protection
+                                    {
+                                        ESP_HTTPX_LOGN("Error parsing status line.");
+                                        callError(MALFORMED_STATUS_LINE);
+                                        return;
+                                    }
+
+                                    currentHeaderBuffer[nullPos] = 0;
+                                    start++;
+                                    foundNewline = true;
+                                    break;
+                                }
+
+                                if (headerBufferOffset >= headerBufferSize)
+                                {
+                                    ESP_HTTPX_LOGN("Error parsing status line.");
+                                    callError(MALFORMED_STATUS_LINE);
+                                    return;
+                                }
+
+                                currentHeaderBuffer[headerBufferOffset] = startBuffer[i];
+                                headerBufferOffset++;
+                                start++;
+                            }
+
+                            if (!foundNewline)
+                            {
+                                continue;
+                            }
+
+                            if (strncmp(currentHeaderBuffer, "HTTP/", 5) != 0)
+                            {
+                                ESP_HTTPX_LOGN("Malformed status line.");
+                                callError(MALFORMED_STATUS_LINE);
                                 return;
                             }
 
-                            statusStart += 1;
-                            callCb(STATUS_RECEIVED_EVENT, statusStart, 3);
-                            currentState = READING_HEADERS;
-
-                            uint8_t *statusEnd = (uint8_t*) memchr(dataBuffer + start, '\n', remaining);
-                            if (statusEnd != nullptr)
+                            size_t statusLen = strlen(currentHeaderBuffer);
+                            char *firstSpace = (char*) memchr(currentHeaderBuffer, ' ', statusLen);
+                            if (firstSpace == nullptr ||
+                                statusLen - (firstSpace - currentHeaderBuffer) < 4 ||
+                                !isdigit((unsigned char) firstSpace[1]) ||
+                                !isdigit((unsigned char) firstSpace[2]) ||
+                                !isdigit((unsigned char) firstSpace[3]))
                             {
-                                start = (statusEnd - dataBuffer) + 1;
+                                ESP_HTTPX_LOGN("Malformed status line.");
+                                callError(MALFORMED_STATUS_LINE);
+                                return;
                             }
 
+                            if (strncmp(firstSpace+1, "100", 3) == 0)
+                            {
+                                setState(READING_STATUS);
+                                continue;
+                            }
+
+                            callCb(STATUS_RECEIVED_EVENT, (uint8_t*) (firstSpace+1), 3);
+                            setState(READING_HEADERS);
                             continue;
                         }
                     case READING_HEADERS:
@@ -518,11 +675,11 @@ namespace EHTTPSCA
                                 {
                                     if (isReceivingChunked)
                                     {
-                                        currentState = READING_CHUNK_SIZE;
+                                        setState(READING_CHUNK_SIZE);
                                     }
                                     else
                                     {
-                                        currentState = READING_DATA;
+                                        setState(READING_DATA);
                                     }
 
                                     start = i + 1;
@@ -535,6 +692,12 @@ namespace EHTTPSCA
                                     currentHeaderBuffer[headerBufferSize - 1] = 0;
                                     callCb(HEADER_RECEIVED_EVENT, (uint8_t*)currentHeaderBuffer, headerBufferSize - 1, true);
                                     headerBufferOffset = 0;
+
+                                    if (hasRedirection && redirectionProcessed)
+                                    {
+                                        ESP_HTTPX_LOGN("Received header is location with redirection status, aborting header parsing.");
+                                        return;
+                                    }
                                 }
 
                                 currentHeaderBuffer[headerBufferOffset++] = c;
@@ -556,6 +719,12 @@ namespace EHTTPSCA
                                     if (lineLength > 0)
                                     {
                                         callCb(HEADER_RECEIVED_EVENT, (uint8_t*) currentHeaderBuffer, lineLength);
+
+                                        if (hasRedirection && redirectionProcessed)
+                                        {
+                                            ESP_HTTPX_LOGN("Received header is location with redirection status, aborting header parsing.");
+                                            return;
+                                        }
                                     }
 
                                     headerBufferOffset = 0;
@@ -573,7 +742,7 @@ namespace EHTTPSCA
                         }
                     case READING_DATA:
                         {
-                            EHTTPSCA_LOGF("Read %zu bytes from the socket\n", remaining);
+                            ESP_HTTPX_LOGF("Read %lu bytes from the socket\n", remaining);
                             callCb(DATA_EVENT, (uint8_t*) dataBuffer + start, remaining);
                             start = read;
                             continue;
@@ -586,25 +755,17 @@ namespace EHTTPSCA
                             {
                                 if (currentChunkOffset >= sizeof(chunkSizeBuf)-1)
                                 {
-                                    EHTTPSCA_LOGN("Could not parse chunk size.");
-                                    callCb(CONNECTION_FAILED_EVENT);
+                                    ESP_HTTPX_LOGN("Could not parse chunk size.");
+                                    callError(MALFORMED_CHUNK_SIZE);
                                     return;
                                 }
 
                                 if (offsetBuffer[i] == '\n')
                                 {
-                                    chunkSizeBuf[currentChunkOffset] = 0;
-                                    currentState = READING_CHUNK_SIZE_CRLF;
+                                    size_t nullPos = chunkSizeBuf[currentChunkOffset-1] == '\r' ? currentChunkOffset-1 : currentChunkOffset;
+                                    chunkSizeBuf[nullPos] = 0;
+                                    setState(READING_CHUNK_SIZE_CRLF);
                                     start += i;
-                                    cont = true;
-                                    break;
-                                }
-
-                                if (offsetBuffer[i] == '\r')
-                                {
-                                    chunkSizeBuf[currentChunkOffset] = 0;
-                                    currentState = READING_CHUNK_SIZE_CRLF;
-                                    start += i + 1;
                                     cont = true;
                                     break;
                                 }
@@ -624,37 +785,35 @@ namespace EHTTPSCA
                             char c = (dataBuffer + start)[0];
                             if (c != '\n')
                             {
-                                EHTTPSCA_LOGN("Error parsing chunk header, invalid line ending.");
-                                callCb(CONNECTION_FAILED_EVENT);
+                                ESP_HTTPX_LOGN("Error parsing chunk header, invalid line ending.");
+                                callError(MALFORMED_CHUNK_SIZE);
                                 return;
                             }
 
                             int res = str2ul(&currentChunkSize, chunkSizeBuf, 16);
                             if (res != STR2INT_SUCCESS)
                             {
-                                EHTTPSCA_LOGF("Error parsing chunk size: %d\n", res);
-                                callCb(CONNECTION_FAILED_EVENT);
+                                ESP_HTTPX_LOGF("Error parsing chunk size: %d\n", res);
+                                callError(MALFORMED_CHUNK_SIZE);
                                 return;
                             }
 
-                            EHTTPSCA_LOGF("Current chunk size is %zu\n", currentChunkSize);
+                            ESP_HTTPX_LOGF("Current chunk size is %zu\n", currentChunkSize);
                             if (currentChunkSize == 0)
                             {
-                                callCb(CONNECTION_FAILED_EVENT); // Will convert to REQUEST_FINISHED automatically
+                                callCb(REQUEST_FINISHED_EVENT);
                                 return;
                             }
 
-                            currentState = READING_CHUNK_DATA;
+                            setState(READING_CHUNK_DATA);
                             start++;
-                            currentChunkOffset = 0;
                             break;
                         }
                     case READING_CHUNK_DATA:
                         {
-                            size_t available = remaining;
-                            size_t remaining = currentChunkSize - currentChunkOffset;
+                            size_t chunkRemaining = currentChunkSize - currentChunkOffset;
 
-                            size_t toConsume = (available < remaining) ? available : remaining;
+                            size_t toConsume = (remaining < chunkRemaining) ? remaining : chunkRemaining;
                             callCb(DATA_EVENT, dataBuffer + start, toConsume);
 
                             currentChunkOffset += toConsume;
@@ -662,8 +821,7 @@ namespace EHTTPSCA
 
                             if (currentChunkOffset == currentChunkSize)
                             {
-                                currentState = READING_CHUNK_DATA_CRLF;
-                                currentChunkOffset = 0;
+                                setState(READING_CHUNK_DATA_CRLF);
                             }
                             break;
                         }
@@ -686,25 +844,25 @@ namespace EHTTPSCA
 
                                 if (dataBuffer[start] != '\n')
                                 {
-                                    EHTTPSCA_LOGN("Invalid chunk terminator (CR not followed by LF).");
-                                    callCb(CONNECTION_FAILED_EVENT);
+                                    ESP_HTTPX_LOGN("Invalid chunk terminator (CR not followed by LF).");
+                                    callError(INVALID_CHUNK_FORMAT);
                                     return;
                                 }
 
                                 start++;
-                                currentState = READING_CHUNK_SIZE;
+                                setState(READING_CHUNK_SIZE);
                                 continue;
                             }
 
                             if (c == '\n')
                             {
                                 start++;
-                                currentState = READING_CHUNK_SIZE;
+                                setState(READING_CHUNK_SIZE);
                                 continue;
                             }
 
-                            EHTTPSCA_LOGN("Invalid chunk terminator (expected CRLF or LF).");
-                            callCb(CONNECTION_FAILED_EVENT);
+                            ESP_HTTPX_LOGN("Invalid chunk terminator (expected CRLF or LF).");
+                            callError(INVALID_CHUNK_FORMAT);
                             return;
                         }
                     default: ;
@@ -713,13 +871,64 @@ namespace EHTTPSCA
             }
         }
 
-        void onEvent(ESPHttpsClientAsyncEventHandler cb)
+        /**
+         * Register callback for client events.
+         */
+        void onEvent(ESPHttpxClientEventHandler cb)
         {
             eventHandler = cb;
         }
     private:
 
-        void sendPath(const char *userAgent = "ESP32-ESP-IDF-CLIENT")
+        void setState(ESPHttpxClientState newState)
+        {
+            currentState = newState;
+
+            switch (newState)
+            {
+            case STOPPED:
+                {
+                    break;
+                }
+            case CONNECTING:
+                {
+                    break;
+                }
+            case READING_DATA:
+                {
+                    redirectionCount = 0;
+                    break;
+                }
+            case SENDING_BODY:
+                {
+                    hasRedirection = false;
+                    redirectionProcessed = false;
+                    break;
+                }
+            case READING_STATUS:
+            case READING_HEADERS:
+                {
+                    headerBufferOffset = 0;
+                    memset(currentHeaderBuffer, 0, headerBufferSize);
+                    memset(terminatorMatchCounts, 0, sizeof(terminatorMatchCounts));
+                    break;
+                }
+            case READING_CHUNK_DATA:
+            case READING_CHUNK_SIZE:
+            case READING_CHUNK_DATA_CRLF:
+                {
+                    redirectionCount = 0;
+                    currentChunkOffset = 0;
+                    break;
+                }
+            case READING_CHUNK_SIZE_CRLF:
+                {
+                    break;
+                }
+            }
+        }
+
+        void sendPath(const char *userAgent = "ESP32-HTTPX-CLIENT")
         {
             const char *methodStr = methodToString(currentMethod);
             if (methodStr == nullptr || sentPath)
@@ -727,21 +936,23 @@ namespace EHTTPSCA
                 return;
             }
 
-            EHTTPSCA_WRITE_BOTH(methodStr);
-            EHTTPSCA_WRITE_BOTH(pathLen == 0 ? "/" : path);
-            EHTTPSCA_WRITE_BOTH(HTTP_VER);
-            EHTTPSCA_WRITE_LN_CHECK_VOID();
+            ESP_HTTPX_LOGN("Sending request line.");
 
-            EHTTPSCA_WRITE_BOTH(HOST_HEADER);
-            EHTTPSCA_WRITE_BOTH(hostname);
-            EHTTPSCA_WRITE_LN_CHECK_VOID();
+            ESP_HTTPX_WRITE_BOTH(methodStr);
+            ESP_HTTPX_WRITE_BOTH(pathLen == 0 ? "/" : path);
+            ESP_HTTPX_WRITE_BOTH(HTTP_VER);
+            ESP_HTTPX_WRITE_LN_CHECK_VOID();
 
-            EHTTPSCA_WRITE_BOTH(USER_AGENT_HEADER);
-            EHTTPSCA_WRITE_BOTH(userAgent);
-            EHTTPSCA_WRITE_LN_CHECK_VOID();
+            ESP_HTTPX_WRITE_BOTH(HOST_HEADER);
+            ESP_HTTPX_WRITE_BOTH(hostname);
+            ESP_HTTPX_WRITE_LN_CHECK_VOID();
 
-            EHTTPSCA_WRITE_BOTH(keepAlive ? CONNECTION_KEEP_HEADER : CONNECTION_CLOSE_HEADER);
-            EHTTPSCA_WRITE_LN_CHECK_VOID();
+            ESP_HTTPX_WRITE_BOTH(USER_AGENT_HEADER);
+            ESP_HTTPX_WRITE_BOTH(userAgent);
+            ESP_HTTPX_WRITE_LN_CHECK_VOID();
+
+            ESP_HTTPX_WRITE_BOTH(keepAlive ? CONNECTION_KEEP_HEADER : CONNECTION_CLOSE_HEADER);
+            ESP_HTTPX_WRITE_LN_CHECK_VOID();
             sentPath = true;
         }
 
@@ -771,9 +982,9 @@ namespace EHTTPSCA
                 else if (sent < 0 &&
                     sent != ESP_TLS_ERR_SSL_WANT_READ &&
                     sent != ESP_TLS_ERR_SSL_WANT_WRITE &&
-                    (mode != PLAIN_HTTP || sent != EHTTPSCA_CLIENT_TIMEOUT))
+                    (mode != PLAIN_HTTP || sent != ESP_HTTPX_CLIENT_TIMEOUT))
                 {
-                    EHTTPSCA_LOGF("Error writing to socket: 0x%x\n", -sent);
+                    ESP_HTTPX_LOGF("Error writing to socket: 0x%x\n", -sent);
                     return sent;
                 }
 
@@ -782,8 +993,8 @@ namespace EHTTPSCA
 
             if (remaining > 0)
             {
-                callCb(CONNECTION_FAILED_EVENT);
-                return EHTTPSCA_CLIENT_TIMEOUT;
+                callError(WRITE_TIMEOUT);
+                return ESP_HTTPX_CLIENT_TIMEOUT;
             }
 
             return len;
@@ -793,8 +1004,8 @@ namespace EHTTPSCA
         {
             if (redirectionCount >= maxRedirections)
             {
-                EHTTPSCA_LOGN("HTTP redirections exceeded the limit.");
-                callCb(CONNECTION_FAILED_EVENT);
+                ESP_HTTPX_LOGN("HTTP redirections exceeded the limit.");
+                callError(TOO_MANY_REDIRECTS);
                 return;
             }
 
@@ -803,44 +1014,116 @@ namespace EHTTPSCA
             bool found = getHeaderValue(locationHeader, headerLen, &valueStart, &valueLen);
             if (!found)
             {
-                callCb(CONNECTION_FAILED_EVENT);
+                callError(INVALID_REDIRECT);
                 return;
             }
 
             if (mode == PLAIN_HTTP && valueLen >= 5 && strncasecmp(valueStart, "https", 5) == 0)
             {
-                EHTTPSCA_LOGN("Unsupported HTTPS redirect, aborting.");
-                callCb(CONNECTION_FAILED_EVENT);
+                ESP_HTTPX_LOGN("Unsupported HTTPS redirect, aborting.");
+                callError(INVALID_REDIRECT);
                 return;
             }
 
-            redirectionCount++;
-            setPath(valueStart, valueLen, currentMethod, keepAlive);
+            const char *protocolSeparator = strnstr(valueStart, "://", valueLen);
+            if (protocolSeparator != nullptr)
+            {
+                size_t protoLen = protocolSeparator - valueStart;
+                if (protoLen < 3) {
+                    ESP_HTTPX_LOGN("Invalid protocol separator position.");
+                    callError(INVALID_REDIRECT);
+                    return;
+                }
 
+                size_t lenWithoutProtocol = valueLen - protoLen - 3;
+                if (strncasecmp(valueStart, "http", 4) != 0 && strncasecmp(valueStart, "https", 5) != 0)
+                {
+                    ESP_HTTPX_LOGN("Unsupported redirect protocol.");
+                    callError(INVALID_REDIRECT);
+                    return;
+                }
+
+                const char *hostStart = protocolSeparator+3;
+                const char *hostEnd = (const char*) memchr(hostStart, ':', lenWithoutProtocol);
+                if (hostEnd == nullptr)
+                {
+                    hostEnd = (const char*) memchr(hostStart, '/', lenWithoutProtocol);
+                }
+                else
+                {
+                    char portBuf[10]{};
+                    const char *portStart = hostEnd + 1;
+                    size_t portOffset = portStart - valueStart;
+                    if (portOffset > valueLen) {
+                        ESP_HTTPX_LOGN("Port offset exceeds header length.");
+                        callError(INVALID_REDIRECT);
+                        return;
+                    }
+
+                    size_t portLen = valueLen - portOffset;
+                    portLen = min(sizeof(portBuf)-1, portLen);
+                    memcpy(portBuf, portStart, portLen);
+                    portBuf[portLen] = 0;
+
+                    unsigned int parsedPort = 0;
+                    int res = str2ul(&parsedPort, portBuf, 10);
+                    if (res != STR2INT_SUCCESS)
+                    {
+                        ESP_HTTPX_LOGF("Error converting redirect port: %d\n", res);
+                        callError(INVALID_REDIRECT);
+                        return;
+                    }
+
+                    ESP_HTTPX_LOGF("New port: %d\n", parsedPort);
+                    setPort(parsedPort);
+                }
+
+                ssize_t hostLength = hostEnd ? (hostEnd - hostStart) : lenWithoutProtocol;
+                if (hostLength <= 0 || (size_t)hostLength > maxHostnameLen) {
+                    ESP_HTTPX_LOGN("Invalid host length.");
+                    callError(INVALID_REDIRECT);
+                    return;
+                }
+
+                ESP_HTTPX_LOG("New hostname: ");
+                ESP_HTTPX_LOGW(hostStart, hostLength);
+                ESP_HTTPX_LOG("\n");
+                setHostname(hostStart, hostLength);
+            }
+
+            redirectionProcessed = true;
+            setPath(valueStart, valueLen, currentMethod, keepAlive); // keep full location as path, some servers need it that way
+            redirectionCount++;
             cleanup();
             start();
         }
 
-        void callCb(const ESPHttpsClientAsyncEvent event, uint8_t *data = nullptr, size_t len = 0, bool truncated = false)
+        void callError(ESPHttpxClientError error)
+        {
+            uint8_t data[] = {(uint8_t) error};
+            callCb(ERROR_EVENT, data, 1);
+        }
+
+        void callCb(const ESPHttpxClientEvent event, uint8_t *data = nullptr, size_t len = 0, bool truncated = false)
         {
             bool wasConnected = (currentState == READING_DATA);
 
             if (event == CONNECTION_SUCCESSFUL_EVENT)
             {
                 sendPath();
-                currentState = SENDING_BODY;
+                setState(SENDING_BODY);
             }
-            else if (event == CONNECTION_FAILED_EVENT)
+            else if (event == CONNECTION_FAILED_EVENT || event == REQUEST_FINISHED_EVENT || event == ERROR_EVENT)
             {
+                if (hasRedirection)
+                {
+                    redirectionProcessed = true;
+                }
                 cleanup();
-            }
-            else if (event == WRITE_BODY_EVENT)
-            {
-                currentState = SENDING_BODY;
             }
             else if (event == STATUS_RECEIVED_EVENT && data != nullptr && len >= 3 && memcmp(data, REDIRECTION_STATUS, 3) == 0)
             {
-                EHTTPSCA_LOGN("Redirection detected.");
+                ESP_HTTPX_LOGN("Redirection detected.");
                 hasRedirection = true;
             }
             else if (event == HEADER_RECEIVED_EVENT && data != nullptr && len > 0)
@@ -850,7 +1133,7 @@ namespace EHTTPSCA
                     isReceivingChunked = true;
                 }
 
-                if (len >= LOCATION_HEADER_LEN && strncasecmp((char*) data, LOCATION_HEADER, LOCATION_HEADER_LEN) == 0)
+                if (hasRedirection && len >= LOCATION_HEADER_LEN && strncasecmp((char*) data, LOCATION_HEADER, LOCATION_HEADER_LEN) == 0)
                 {
                     handleRedirection((const char*) data, len);
                     return;
@@ -859,14 +1142,7 @@ namespace EHTTPSCA
 
             if (eventHandler)
             {
-                if (event == CONNECTION_FAILED_EVENT && wasConnected)
-                {
-                    eventHandler(REQUEST_FINISHED_EVENT, data, len, truncated);
-                }
-                else
-                {
-                    eventHandler(event, data, len, truncated);
-                }
+                eventHandler(event, data, len, truncated);
             }
         }
 
@@ -886,8 +1162,6 @@ namespace EHTTPSCA
             contentSentLen = 0;
             contentLength = 0;
             isReceivingChunked = false;
-            hasRedirection = false;
-            redirectionCount = 0;
         }
 
         esp_tls_conn_state_t getTlsState()
@@ -924,15 +1198,15 @@ namespace EHTTPSCA
 
         int port;
         Mode mode;
-        ESPHttpsClientAsyncState currentState;
-        ESPHttpsClientAsyncEventHandler eventHandler;
+        ESPHttpxClientState currentState;
+        ESPHttpxClientEventHandler eventHandler;
         esp_tls_t *handle;
 
         const char *cert;
         size_t certLen;
         esp_tls_cfg_t config;
 
-        uint8_t dataBuffer[totalDataSize];
+        uint8_t dataBuffer[dataBufferSize];
 
         size_t headerBufferOffset;
         char currentHeaderBuffer[headerBufferSize];
@@ -948,6 +1222,7 @@ namespace EHTTPSCA
         char chunkSizeBuf[32]{};
 
         bool hasRedirection;
+        bool redirectionProcessed;
         size_t redirectionCount;
         size_t maxRedirections;
     };
