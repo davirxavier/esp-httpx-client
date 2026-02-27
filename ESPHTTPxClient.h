@@ -203,6 +203,7 @@ namespace ESP_HTTPX_CLIENT
         HEADER_RECEIVED_EVENT,
         DATA_EVENT,
         REQUEST_FINISHED_EVENT,
+        CONNECTION_CLOSED_EVENT,
     };
 
     enum ESPHttpxClientError
@@ -216,6 +217,8 @@ namespace ESP_HTTPX_CLIENT
         WRITE_TOO_BIG,
         WRITE_ERROR,
         INVALID_HOSTNAME,
+        INVALID_CONTENT_LENGTH,
+        INVALID_QUERY_VALUE,
     };
 
     static const char* HTTP_VER PROGMEM = " HTTP/1.1";
@@ -276,7 +279,6 @@ namespace ESP_HTTPX_CLIENT
         {
             currentMethod = HTTP_GET;
             keepAlive = false;
-            sentPath = false;
             setState(STOPPED);
             eventHandler = nullptr;
             handle = nullptr;
@@ -297,6 +299,7 @@ namespace ESP_HTTPX_CLIENT
             writeHandler = nullptr;
             currentWriteLen = 0;
             currentWriteOffset = 0;
+            receivingContentLength = 0;
 
             for (size_t i = 0; i < TERMINATORS_COUNT; i++)
             {
@@ -378,7 +381,6 @@ namespace ESP_HTTPX_CLIENT
          *
          * @param name header name
          * @param value header value
-         * @param endHeaders If true will end the headers section of the HTTP request. Set to true for the last header.
          */
         void sendHeader(const char *name, const char *value)
         {
@@ -541,14 +543,14 @@ namespace ESP_HTTPX_CLIENT
                 if (read == -0x004C) // Reading information from the socket failed
                 {
                     ESP_HTTPX_LOGN("Connection has been closed forcefully.");
-                    callCb(REQUEST_FINISHED_EVENT);
+                    callCb(CONNECTION_CLOSED_EVENT);
                     return;
                 }
 
                 if (read == -0x50)
                 {
                     ESP_HTTPX_LOGN("Connection reset by peer.");
-                    callCb(REQUEST_FINISHED_EVENT);
+                    callCb(CONNECTION_CLOSED_EVENT);
                     return;
                 }
 
@@ -763,6 +765,12 @@ namespace ESP_HTTPX_CLIENT
                             ESP_HTTPX_LOGF("Read %lu bytes from the socket\n", remaining);
                             callCb(DATA_EVENT, (uint8_t*) dataBuffer + start, remaining);
                             start = read;
+
+                            currentChunkOffset += read;
+                            if (currentChunkOffset >= receivingContentLength)
+                            {
+                                callCb(REQUEST_FINISHED_EVENT);
+                            }
                             continue;
                         }
                     case READING_CHUNK_SIZE:
@@ -946,6 +954,20 @@ namespace ESP_HTTPX_CLIENT
             writeUrlEncoded(path, false);
         }
 
+        void sendQueryParam(const char *name, long long value)
+        {
+            char numBuf[32]{};
+            int w = snprintf(numBuf, sizeof(numBuf), "%lld", value);
+            if (w >= sizeof(numBuf))
+            {
+                ESP_HTTPX_LOGN("Number is too big for the query value, send as string directly.");
+                callError(INVALID_CHUNK_FORMAT);
+                return;
+            }
+
+            sendQueryParam(name, numBuf);
+        }
+
         void sendQueryParam(const char *name, const char *value)
         {
             ESP_HTTPX_WRITE_CHECK_VOID(sentFirstQueryParam ? "&" : "?", 1, 0);
@@ -1000,6 +1022,11 @@ namespace ESP_HTTPX_CLIENT
             return flush();
         }
 
+        void sendRequest()
+        {
+            callCb(CONNECTION_SUCCESSFUL_EVENT);
+        }
+
         /**
          * Register callback for client events.
          */
@@ -1031,6 +1058,7 @@ namespace ESP_HTTPX_CLIENT
                 }
             case CONNECTED:
                 {
+                    sentFirstQueryParam = false;
                     break;
                 }
             case READING_DATA:
@@ -1075,7 +1103,7 @@ namespace ESP_HTTPX_CLIENT
         void writeHttpLine(const char *userAgent = "ESP32-HTTPX-CLIENT")
         {
             const char *methodStr = methodToString(currentMethod);
-            if (methodStr == nullptr || sentPath)
+            if (methodStr == nullptr)
             {
                 return;
             }
@@ -1097,7 +1125,6 @@ namespace ESP_HTTPX_CLIENT
 
             ESP_HTTPX_WRITE_BOTH(keepAlive ? CONNECTION_KEEP_HEADER : CONNECTION_CLOSE_HEADER);
             ESP_HTTPX_WRITE_LN_CHECK_VOID();
-            sentPath = true;
         }
 
         ssize_t writeWithTimeout(const char *data, size_t len, unsigned long timeout = 2500)
@@ -1289,6 +1316,36 @@ namespace ESP_HTTPX_CLIENT
             start();
         }
 
+        void parseContentLength(const char *header, size_t len)
+        {
+            const char *valueStart = nullptr;
+            size_t valueLen = 0;
+
+            bool found = getHeaderValue(header, len, &valueStart, &valueLen);
+            if (!found || valueStart == nullptr || valueLen == 0)
+            {
+                ESP_HTTPX_LOGN("Could not parse content-length header.");
+                callError(INVALID_CONTENT_LENGTH);
+                return;
+            }
+
+            char valueBuffer[32]{};
+            size_t valueBufferLen = min(valueLen, sizeof(valueBuffer)-1);
+            memcpy(valueBuffer, valueStart, valueBufferLen);
+            valueBuffer[valueBufferLen] = 0;
+
+            int parseRes = str2ul(&receivingContentLength, valueBuffer, 10);
+            if (parseRes != STR2INT_SUCCESS)
+            {
+                ESP_HTTPX_LOGF("Error parsing content-length: %d\n", parseRes);
+                callError(INVALID_CONTENT_LENGTH);
+                receivingContentLength = 0;
+                return;
+            }
+
+            ESP_HTTPX_LOGF("Parsed content-length: %lu\n", receivingContentLength);
+        }
+
         void callError(ESPHttpxClientError error)
         {
             uint8_t data[] = {(uint8_t) error};
@@ -1302,7 +1359,7 @@ namespace ESP_HTTPX_CLIENT
                 setState(CONNECTED);
                 writeHttpLine();
             }
-            else if (event == CONNECTION_FAILED_EVENT || event == REQUEST_FINISHED_EVENT || event == ERROR_EVENT)
+            else if (event == CONNECTION_FAILED_EVENT || event == CONNECTION_CLOSED_EVENT || event == ERROR_EVENT)
             {
                 if (hasRedirection)
                 {
@@ -1321,10 +1378,21 @@ namespace ESP_HTTPX_CLIENT
                 {
                     isReceivingChunked = true;
                 }
+                else if (len >= 14 && strncasecmp((char*) data, "Content-Length", 14) == 0) // TODO make constant
+                {
+                    parseContentLength((char*) data, len);
+                }
 
                 if (hasRedirection && len >= LOCATION_HEADER_LEN && strncasecmp((char*) data, LOCATION_HEADER, LOCATION_HEADER_LEN) == 0)
                 {
                     handleRedirection((const char*) data, len);
+                    return;
+                }
+
+                if (isReceivingChunked && receivingContentLength > 0)
+                {
+                    ESP_HTTPX_LOGN("Received chunked transfer encoding and content-length in the same request.");
+                    callError(INVALID_CONTENT_LENGTH);
                     return;
                 }
             }
@@ -1343,7 +1411,6 @@ namespace ESP_HTTPX_CLIENT
                 handle = nullptr;
             }
 
-            sentPath = false;
             currentState = STOPPED;
             headerBufferOffset = 0;
             currentChunkSize = 0;
@@ -1355,9 +1422,10 @@ namespace ESP_HTTPX_CLIENT
             currentWriteOffset = 0;
             currentWriteTotal = 0;
             sendingZeroChunk = false;
+            receivingContentLength = 0;
         }
 
-        esp_tls_conn_state_t getTlsState()
+        esp_tls_conn_state_t getTlsState() const
         {
             if (handle == nullptr)
             {
@@ -1382,7 +1450,6 @@ namespace ESP_HTTPX_CLIENT
 
         Method currentMethod;
         bool keepAlive;
-        bool sentPath;
 
         int port;
         Mode mode;
@@ -1415,6 +1482,7 @@ namespace ESP_HTTPX_CLIENT
         size_t currentChunkSize;
         size_t currentChunkOffset;
         char chunkSizeBuf[32]{};
+        size_t receivingContentLength;
 
         bool hasRedirection;
         bool redirectionProcessed;
