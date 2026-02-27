@@ -8,6 +8,9 @@
 #include <esp_tls.h>
 #include <esp_crt_bundle.h>
 
+/**
+ * Timeout return value for sync write operations.
+ */
 #define ESP_HTTPX_CLIENT_TIMEOUT (-0x1)
 
 #ifdef ESP_HTTPX_ENABLE_LOGGING
@@ -55,6 +58,13 @@ namespace ESP_HTTPX_CLIENT
         STR2INT_INCONVERTIBLE
     } str2int_errno;
 
+    /**
+     * Converts a string to an unsigned integer.
+     * @param out Pointer to store the result.
+     * @param s Input string.
+     * @param base Numeric base.
+     * @return Status of conversion (success, overflow, underflow, or inconvertible).
+     */
     inline str2int_errno str2ul(unsigned *out, char *s, int base) {
         char *end;
         if (s[0] == '\0' || isspace((unsigned char) s[0]))
@@ -69,6 +79,13 @@ namespace ESP_HTTPX_CLIENT
         return STR2INT_SUCCESS;
     }
 
+
+    /**
+     * Enum for client operation modes:
+     * - PLAIN_HTTP: Non-secure HTTP.
+     * - HTTPS_SECURE: HTTPS with certificate validation.
+     * - HTTPS_INSECURE: HTTPS without certificate validation.
+     */
     enum Mode
     {
         PLAIN_HTTP,
@@ -76,12 +93,18 @@ namespace ESP_HTTPX_CLIENT
         HTTPS_INSECURE, // Only works with the esp-idf, because of pre-compiled code
     };
 
+    /**
+     * Enum for HTTP methods.
+     */
     enum Method
     {
         HTTP_GET = 0,
         HTTP_POST,
         HTTP_PUT,
         HTTP_DELETE,
+        HTTP_PATCH,
+        HTTP_HEAD,
+        HTTP_OPTIONS,
     };
 
     inline const char* methodToString(const Method method)
@@ -92,10 +115,21 @@ namespace ESP_HTTPX_CLIENT
             case HTTP_POST: return "POST ";
             case HTTP_PUT: return "PUT ";
             case HTTP_DELETE: return "DELETE ";
+            case HTTP_PATCH: return "PATCH ";
+            case HTTP_HEAD: return "HEAD ";
+            case HTTP_OPTIONS: return "OPTIONS ";
             default: return nullptr;
         }
     }
 
+    /**
+     * Extracts the value portion of an HTTP header line.
+     * @param header Input header string.
+     * @param len Header string length.
+     * @param outStart Output pointer to the start of the header value.
+     * @param outLen Length of the header value.
+     * @return True if a value was successfully found.
+     */
     inline bool getHeaderValue(const char *header, size_t len, const char **outStart, size_t *outLen)
     {
         if (header == nullptr || outStart == nullptr || outLen == nullptr || len == 0)
@@ -140,46 +174,13 @@ namespace ESP_HTTPX_CLIENT
         return true;
     }
 
-
-    inline void urlEncode(const char *src, char *dest, size_t dest_size)
-    {
-        const char *hex = "0123456789ABCDEF";
-        size_t i = 0;
-
-        while (*src && i < dest_size - 1)
-        {
-            unsigned char c = (unsigned char)*src;
-
-            // Unreserved characters (RFC 3986)
-            if (isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~')
-            {
-                if (i + 1 >= dest_size) break;
-                dest[i++] = c;
-            }
-            // Space becomes +
-            else if (c == ' ')
-            {
-                if (i + 1 >= dest_size) break;
-                dest[i++] = '+';
-            }
-            // Percent-encode everything else
-            else
-            {
-                if (i + 3 >= dest_size) break;
-                dest[i++] = '%';
-                dest[i++] = hex[c >> 4];
-                dest[i++] = hex[c & 0x0F];
-            }
-
-            src++;
-        }
-
-        dest[i] = '\0';
-    }
-
+    /**
+     * Enum representing the internal state of the client state machine.
+     * WARNING: Maintain element ordering, state machine depends on this.
+     */
     enum ESPHttpxClientState
     {
-        STOPPED = 0, // WARNING: Maintain element ordering. State machine depends on this order.
+        STOPPED = 0,
         CONNECTING,
         CONNECTED,
         WRITING_BODY,
@@ -192,6 +193,10 @@ namespace ESP_HTTPX_CLIENT
         READING_CHUNK_DATA_CRLF,
     };
 
+    /**
+     * Enum representing client events.
+     * WARNING: Maintain element ordering, state machine depends on this.
+     */
     enum ESPHttpxClientEvent
     {
         SEND_HOSTNAME_EVENT,
@@ -206,6 +211,9 @@ namespace ESP_HTTPX_CLIENT
         CONNECTION_CLOSED_EVENT,
     };
 
+    /**
+     * Enum representing possible client errors.
+     */
     enum ESPHttpxClientError
     {
         MALFORMED_STATUS_LINE = 0,
@@ -219,10 +227,12 @@ namespace ESP_HTTPX_CLIENT
         INVALID_HOSTNAME,
         INVALID_CONTENT_LENGTH,
         INVALID_QUERY_VALUE,
+        INCORRECT_BYTES_WRITTEN,
     };
 
-    static const char* HTTP_VER PROGMEM = " HTTP/1.1";
+    static const char *HTTP_VER PROGMEM = " HTTP/1.1";
     static const char *CONTENT_LENGTH_HEADER PROGMEM = "Content-Length";
+    static const size_t CONTENT_LENGTH_HEADER_LEN = 14;
 
     static const char *TRANSFER_ENCODING_HEADER PROGMEM = "Transfer-Encoding";
     static constexpr size_t TRANSFER_ENCODING_HEADER_LEN = 17;
@@ -247,29 +257,38 @@ namespace ESP_HTTPX_CLIENT
     static const char LINE_FEED[] PROGMEM = "\r\n";
     static constexpr size_t LINE_FEED_LEN = 2;
 
+    /**
+     * Handler for client events.
+     * @param event The type of event that occurred.
+     * @param data Pointer to the event data buffer (may be NULL depending on event type; always check before accessing).
+     * @param len Size of the event data buffer.
+     * @param headerTruncated True if the header was truncated (relevant for HEADER_RECEIVED_EVENT).
+     */
     using ESPHttpxClientEventHandler = std::function<void(ESPHttpxClientEvent event, uint8_t *data, size_t len, bool headerTruncated)>;
-    using ESPHttpxClientWriteHandler = std::function<ssize_t(uint8_t *buffer, size_t bufferSize, size_t index)>;
 
     /**
-     * Flash size note:
-     *
-     * Each unique template parameter combination generates a new copy of codethis class. On ESP32 (ESP-IDF, -Os), this
-     * typically increases flash usage by ~700 bytes per unique configuration.
-     *
-     * Avoid creating many different size variations unless necessary.
+     * Handler for writing data to the HTTP request body.
+     * @param buffer Pointer to the client’s data buffer. Write your data here.
+     * @param bufferSize Maximum number of bytes you can write to the buffer.
+     * @param index The write index; prefer writing relative to this index if possible.
+     * @returns The number of bytes written, or a value <= 0 to indicate no more data.
+     */
+    using ESPHttpxClientWriteHandler = std::function<ssize_t(uint8_t *buffer, size_t bufferSize, size_t index)>;
+
+
+    /**
+     * Flash usage note:
+     * Each unique template instantiation creates a separate copy of the class,
+     * increasing flash usage (~700 bytes per configuration on ESP32). Avoid excessive variations.
      *
      * @tparam dataBufferSize    Size of the internal general data buffer.
-     * @tparam headerBufferSize  Size of the response header buffer. This determines
-     *                           the maximum header line length delivered in the
-     *                           HEADER_RECEIVED_EVENT.
-     * @tparam maxHostnameLen    Maximum hostname length (including null terminator).
+     * @tparam headerBufferSize  Size of the response header buffer; determines maximum header line length.
      */
-    template <size_t dataBufferSize = 512, size_t headerBufferSize = 256, size_t maxHostnameLen = 128>
+    template <size_t dataBufferSize = 512, size_t headerBufferSize = 256>
     class ESPHttpxClient
     {
-        static_assert(dataBufferSize > 0, "dataBufferSize must be > 0");
-        static_assert(headerBufferSize > 0, "headerBufferSize must be > 0");
-        static_assert(maxHostnameLen > 0, "maxHostnameLen must be > 0");
+        static_assert(dataBufferSize > 64, "dataBufferSize must be > 64");
+        static_assert(headerBufferSize > 64, "headerBufferSize must be > 64");
 
     public:
         ESPHttpxClient(const ESPHttpxClient&) = delete;
@@ -312,15 +331,19 @@ namespace ESP_HTTPX_CLIENT
             cleanup();
         }
 
+       /**
+        * Sets the maximum allowed number of HTTP redirections per request.
+        * @param max Maximum redirections.
+        */
         void setMaxRedirections(size_t max)
         {
             this->maxRedirections = max;
         }
 
         /**
-         * Certificate for the server. Will use this instead of the global_ca_store.
-         * @param cert Certificate buffer. Should include the null terminator if in PEM format.
-         * @param len Certificate length. Should include the null terminator if in PEM format.
+         * Sets the TLS/HTTPS certificate for the server.
+         * @param cert Certificate buffer (include null terminator if PEM format).
+         * @param len Length of certificate buffer.
          */
         void setCert(const char *cert, size_t len)
         {
@@ -329,8 +352,8 @@ namespace ESP_HTTPX_CLIENT
         }
 
         /**
-         * Connection port;
-         * @param port desired port or -1 to use default ports
+         * Sets the connection port.
+         * @param port Desired port or -1 to use default (80 for HTTP, 443 for HTTPS).
          */
         void setPort(int port)
         {
@@ -347,7 +370,7 @@ namespace ESP_HTTPX_CLIENT
         }
 
         /**
-         * Starts the HTTP request. Set the envent handler with onEvent before calling this.
+         * Starts the HTTP request. Ensure the event handler is set via onEvent() beforehand.
          */
         void start()
         {
@@ -377,10 +400,9 @@ namespace ESP_HTTPX_CLIENT
         }
 
         /**
-         * Sends a HTTP header. Call in the CONNECTION_SUCCESSFUL_EVENT callback passed to onEvent.
-         *
-         * @param name header name
-         * @param value header value
+         * Sends a single HTTP header.
+         * @param name Header name.
+         * @param value Header value.
          */
         void sendHeader(const char *name, const char *value)
         {
@@ -391,8 +413,9 @@ namespace ESP_HTTPX_CLIENT
         }
 
         /**
-         * Sends the request Content-Length header. Should always be called after all other desired headers have been sent.
-         * @param length Length of the content to be sent. Set to less than 0 to use chunked transfer.
+         * Sends the Content-Length or Transfer-Encoding header. This function should always be called after all other
+         * desired headers have been sent, it will complete the headers section of the request.
+         * @param length Length of the body; negative value enables chunked transfer.
          */
         void sendContentLength(ssize_t length)
         {
@@ -417,18 +440,24 @@ namespace ESP_HTTPX_CLIENT
             ESP_HTTPX_WRITE_LN_CHECK_VOID();
         }
 
+        /**
+         * Returns true if the request is using chunked transfer encoding.
+         */
         bool isSendingChunked() const
         {
             return contentLength < 0;
         }
 
-        void startWrite()
+        /**
+         * Begin writing the HTTP request body.
+         */
+        void startBody()
         {
             setState(WRITING_BODY);
         }
 
         /**
-         * Must be called to end the writing of the body, if using chunked transfer (content-length < 0).
+         * Ends a chunked transfer body.
          */
         void endChunkedBody()
         {
@@ -440,7 +469,7 @@ namespace ESP_HTTPX_CLIENT
         }
 
         /**
-         * Stop request and close connection.
+         * Closes the request and cleans up the connection.
          */
         void close()
         {
@@ -510,6 +539,12 @@ namespace ESP_HTTPX_CLIENT
                             memcpy(dataBuffer, "0\r\n\r\n", 5);
                             currentWriteLen = 5;
                             currentWriteOffset = 0;
+                            return;
+                        }
+                        else if (currentWriteTotal != contentLength)
+                        {
+                            ESP_HTTPX_LOGF("Incorrect number of bytes written to body: %lu, expected %lu\n", currentWriteTotal, contentLength);
+                            callError(INCORRECT_BYTES_WRITTEN);
                             return;
                         }
 
@@ -897,11 +932,17 @@ namespace ESP_HTTPX_CLIENT
             }
         }
 
+        /**
+         * Sends the hostname for connection.
+         */
         void sendHostname(const char *hostname)
         {
             sendHostname(hostname, strlen(hostname));
         }
 
+        /**
+         * Sends the hostname for connection.
+         */
         void sendHostname(const char *hostname, size_t len)
         {
             if (hostname == nullptr || len == 0)
@@ -933,11 +974,18 @@ namespace ESP_HTTPX_CLIENT
             }
         }
 
+        /**
+         * If true, the client will send the value "keep-alive" header, and the client will try to maintain the connection.
+         * If false, the client will send the value "close", and close the connection after the request is done.
+         */
         void setKeepAlive(bool keepAlive)
         {
             this->keepAlive = keepAlive;
         }
 
+        /**
+         * Sends the request path.
+         */
         void sendPath(const char *path)
         {
             if (path == nullptr || path[0] == 0)
@@ -954,6 +1002,9 @@ namespace ESP_HTTPX_CLIENT
             writeUrlEncoded(path, false);
         }
 
+        /**
+         * Sends a query parameter, should be called after sendPath. Will url-encode the name and value automatically.
+         */
         void sendQueryParam(const char *name, long long value)
         {
             char numBuf[32]{};
@@ -968,6 +1019,9 @@ namespace ESP_HTTPX_CLIENT
             sendQueryParam(name, numBuf);
         }
 
+        /**
+        * Sends a query parameter, should be called after sendPath. Will url-encode the name and value automatically.
+        */
         void sendQueryParam(const char *name, const char *value)
         {
             ESP_HTTPX_WRITE_CHECK_VOID(sentFirstQueryParam ? "&" : "?", 1, 0);
@@ -1022,6 +1076,9 @@ namespace ESP_HTTPX_CLIENT
             return flush();
         }
 
+        /**
+         * Sends the request again. If using keep-alive, should be called after the REQUEST_FINISHED_EVENT to start another request.
+         */
         void sendRequest()
         {
             callCb(CONNECTION_SUCCESSFUL_EVENT);
@@ -1035,6 +1092,9 @@ namespace ESP_HTTPX_CLIENT
             eventHandler = cb;
         }
 
+        /**
+         * Register callback for writing data to body.
+         */
         void onWriteData(ESPHttpxClientWriteHandler cb)
         {
             this->writeHandler = cb;
@@ -1260,7 +1320,7 @@ namespace ESP_HTTPX_CLIENT
                 }
 
                 hostLength = hostEnd ? (hostEnd - hostStart) : lenWithoutProtocol;
-                if (hostLength <= 0 || (size_t)hostLength > maxHostnameLen) {
+                if (hostLength <= 0) {
                     ESP_HTTPX_LOGN("Invalid host length.");
                     callError(INVALID_REDIRECT);
                     return;
@@ -1378,7 +1438,7 @@ namespace ESP_HTTPX_CLIENT
                 {
                     isReceivingChunked = true;
                 }
-                else if (len >= 14 && strncasecmp((char*) data, "Content-Length", 14) == 0) // TODO make constant
+                else if (len >= CONTENT_LENGTH_HEADER_LEN && strncasecmp((char*) data, CONTENT_LENGTH_HEADER, CONTENT_LENGTH_HEADER_LEN) == 0)
                 {
                     parseContentLength((char*) data, len);
                 }
