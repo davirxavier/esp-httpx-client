@@ -140,11 +140,49 @@ namespace ESP_HTTPX_CLIENT
         return true;
     }
 
+
+    inline void urlEncode(const char *src, char *dest, size_t dest_size)
+    {
+        const char *hex = "0123456789ABCDEF";
+        size_t i = 0;
+
+        while (*src && i < dest_size - 1)
+        {
+            unsigned char c = (unsigned char)*src;
+
+            // Unreserved characters (RFC 3986)
+            if (isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~')
+            {
+                if (i + 1 >= dest_size) break;
+                dest[i++] = c;
+            }
+            // Space becomes +
+            else if (c == ' ')
+            {
+                if (i + 1 >= dest_size) break;
+                dest[i++] = '+';
+            }
+            // Percent-encode everything else
+            else
+            {
+                if (i + 3 >= dest_size) break;
+                dest[i++] = '%';
+                dest[i++] = hex[c >> 4];
+                dest[i++] = hex[c & 0x0F];
+            }
+
+            src++;
+        }
+
+        dest[i] = '\0';
+    }
+
     enum ESPHttpxClientState
     {
         STOPPED = 0,
         CONNECTING,
-        SENDING_BODY,
+        CONNECTED,
+        WRITING_BODY,
         READING_STATUS,
         READING_HEADERS,
         READING_DATA,
@@ -158,8 +196,8 @@ namespace ESP_HTTPX_CLIENT
     {
         CONNECTION_SUCCESSFUL_EVENT,
         CONNECTION_FAILED_EVENT,
+        SEND_PATH_AND_QUERY_EVENT,
         ERROR_EVENT,
-        WRITE_BODY_EVENT,
         STATUS_RECEIVED_EVENT,
         HEADER_RECEIVED_EVENT,
         DATA_EVENT,
@@ -174,6 +212,8 @@ namespace ESP_HTTPX_CLIENT
         WRITE_TIMEOUT,
         TOO_MANY_REDIRECTS,
         INVALID_REDIRECT,
+        WRITE_TOO_BIG,
+        WRITE_ERROR,
     };
 
     static const char* HTTP_VER PROGMEM = " HTTP/1.1";
@@ -203,7 +243,7 @@ namespace ESP_HTTPX_CLIENT
     static constexpr size_t LINE_FEED_LEN = 2;
 
     using ESPHttpxClientEventHandler = std::function<void(ESPHttpxClientEvent event, uint8_t *data, size_t len, bool headerTruncated)>;
-    using ESPHttpxClientWriteHandler = std::function<bool(uint8_t *buffer, size_t bufferSize, size_t index, bool next)>;
+    using ESPHttpxClientWriteHandler = std::function<ssize_t(uint8_t *buffer, size_t bufferSize, size_t index)>;
 
     /**
      * Flash size note:
@@ -218,26 +258,23 @@ namespace ESP_HTTPX_CLIENT
      *                           the maximum header line length delivered in the
      *                           HEADER_RECEIVED_EVENT.
      * @tparam maxHostnameLen    Maximum hostname length (including null terminator).
-     * @tparam maxPathLen        Maximum request path length (including null terminator).
      */
-    template <size_t dataBufferSize = 512, size_t headerBufferSize = 256, size_t maxHostnameLen = 128, size_t maxPathLen = 256>
+    template <size_t dataBufferSize = 512, size_t headerBufferSize = 256, size_t maxHostnameLen = 128>
     class ESPHttpxClient
     {
         static_assert(dataBufferSize > 0, "dataBufferSize must be > 0");
         static_assert(headerBufferSize > 0, "headerBufferSize must be > 0");
         static_assert(maxHostnameLen > 0, "maxHostnameLen must be > 0");
-        static_assert(maxPathLen > 0, "maxPathLen must be > 0");
 
     public:
         ESPHttpxClient(const ESPHttpxClient&) = delete;
         ESPHttpxClient& operator=(const ESPHttpxClient&) = delete;
 
-        explicit ESPHttpxClient(): path{}, hostname{}, dataBuffer{}, currentHeaderBuffer{}
+        explicit ESPHttpxClient(): hostname{}, dataBuffer{}, currentHeaderBuffer{}
         {
             currentMethod = HTTP_GET;
             keepAlive = false;
             sentPath = false;
-            pathLen = 0;
             hostnameLen = 0;
             setState(STOPPED);
             eventHandler = nullptr;
@@ -256,6 +293,9 @@ namespace ESP_HTTPX_CLIENT
             hasRedirection = false;
             redirectionCount = 0;
             maxRedirections = 5;
+            writeHandler = nullptr;
+            currentWriteLen = 0;
+            currentWriteOffset = 0;
 
             for (size_t i = 0; i < TERMINATORS_COUNT; i++)
             {
@@ -301,28 +341,6 @@ namespace ESP_HTTPX_CLIENT
             memcpy(this->hostname, host, finalLen);
             this->hostname[finalLen] = 0;
             hostnameLen = finalLen;
-        }
-
-        /**
-         * Sets the request path. Max length is defined by maxPathlen template parameter;
-         */
-        void setPath(const char *path, Method method, bool keepAlive = false)
-        {
-            setPath(path, strlen(path), method, keepAlive);
-        }
-
-        /**
-         * Sets the request path. Max length is defined by maxPathlen template parameter;
-         */
-        void setPath(const char *path, size_t len, Method method, bool keepAlive = false)
-        {
-            currentMethod = method;
-            this->keepAlive = keepAlive;
-
-            size_t finalLen = min(maxPathLen-1, len);
-            memcpy(this->path, path, finalLen);
-            this->path[finalLen] = 0;
-            pathLen = finalLen;
         }
 
         /**
@@ -418,7 +436,6 @@ namespace ESP_HTTPX_CLIENT
             }
 
             ESP_HTTPX_WRITE_LN_CHECK_VOID();
-            callCb(WRITE_BODY_EVENT);
         }
 
         bool isSendingChunked() const
@@ -426,56 +443,9 @@ namespace ESP_HTTPX_CLIENT
             return contentLength < 0;
         }
 
-        /**
-         * Writes a string to the request's body.
-         * @param data String to be written, has to be null terminated.
-         * @return If the write has succeeded or not.
-         */
-        bool write(const char *data)
+        void startWrite()
         {
-            return write((uint8_t*) data, strlen(data));
-        }
-
-        /**
-         * Writes data to the request body.
-         * @return If the write has succeeded or not.
-         */
-        bool write(const char *data, size_t len)
-        {
-            return write((const uint8_t*) data, len);
-        }
-
-        /**
-        * Writes data to the request body.
-        * @return If the write has succeeded or not.
-        */
-        bool write(const uint8_t *data, size_t len)
-        {
-            if (currentState != SENDING_BODY)
-            {
-                return false;
-            }
-
-            bool isChunked = isSendingChunked();
-            if (isChunked)
-            {
-                char numBuf[32]{};
-                snprintf(numBuf, sizeof(numBuf), "%lx\r\n", len);
-                ESP_HTTPX_WRITE_CHECK(numBuf, strlen(numBuf), false, 0);
-            }
-
-            ESP_HTTPX_WRITE_CHECK(data, len, false, 0);
-            contentSentLen += len;
-            if (isChunked)
-            {
-                ESP_HTTPX_WRITE_CHECK(LINE_FEED, LINE_FEED_LEN, false, 0);
-            }
-
-            if (!isChunked && contentSentLen >= contentLength)
-            {
-                setState(READING_STATUS);
-            }
-            return true;
+            setState(WRITING_BODY);
         }
 
         /**
@@ -517,7 +487,90 @@ namespace ESP_HTTPX_CLIENT
                 }
             }
 
-            if (handle != nullptr && currentState > SENDING_BODY)
+            if (handle != nullptr && currentState == WRITING_BODY)
+            {
+                if (writeHandler == nullptr)
+                {
+                    setState(READING_STATUS);
+                    return;
+                }
+
+                if (currentWriteOffset >= currentWriteLen)
+                {
+                    static constexpr size_t chunkHeaderMaxLen = 30;
+
+                    uint8_t *actualBuffer = isSendingChunked() ? dataBuffer + chunkHeaderMaxLen : dataBuffer; // reserve space for chunk size and crlf
+                    size_t actualBufferLen = isSendingChunked() ? dataBufferSize-chunkHeaderMaxLen-2 : dataBufferSize; // reserve space for chunk end crlf
+
+                    currentWriteLen = writeHandler(actualBuffer, actualBufferLen, currentWriteTotal);
+                    currentWriteTotal += currentWriteLen;
+                    currentWriteOffset = 0;
+
+                    if (currentWriteLen > actualBufferLen)
+                    {
+                        ESP_HTTPX_LOGN("Body data buffer overflow.");
+                        callError(WRITE_TOO_BIG);
+                        return;
+                    }
+
+                    if (isSendingChunked() && currentWriteLen > 0)
+                    {
+                        char chunkSizeBuf[chunkHeaderMaxLen + 1]{};
+                        snprintf(chunkSizeBuf, sizeof(chunkSizeBuf), "%x\r\n", currentWriteLen);
+                        size_t chunkSizeLen = strlen(chunkSizeBuf);
+                        if (chunkSizeLen > chunkHeaderMaxLen)
+                        {
+                            ESP_HTTPX_LOGN("Chunk header buffer overflow.");
+                            callError(WRITE_TOO_BIG);
+                            return;
+                        }
+
+                        uint8_t *headerStart = actualBuffer-chunkSizeLen;
+                        memcpy(headerStart, chunkSizeBuf, chunkSizeLen);
+
+                        actualBuffer[currentWriteLen] = '\r';
+                        actualBuffer[currentWriteLen+1] = '\n';
+
+                        currentWriteLen += chunkSizeLen + 2;
+                        memmove(dataBuffer, headerStart, currentWriteLen);
+                    }
+
+                    if (currentWriteLen <= 0)
+                    {
+                        if (isSendingChunked())
+                        {
+                            sendingZeroChunk = true;
+                            memcpy(dataBuffer, "0\r\n\r\n", 5);
+                            currentWriteLen = 5;
+                            currentWriteOffset = 0;
+                            return;
+                        }
+
+                        setState(READING_STATUS);
+                        ESP_HTTPX_LOG('\n');
+                    }
+                }
+                else
+                {
+                    ssize_t written = esp_tls_conn_write(handle, dataBuffer + currentWriteOffset, currentWriteLen - currentWriteOffset); // TODO handle 0 writes
+                    ESP_HTTPX_LOGW(dataBuffer + currentWriteOffset, currentWriteLen - currentWriteOffset);
+
+                    if (hasWriteError(written))
+                    {
+                        ESP_HTTPX_LOGF("Error writing to body: 0x%x\n", written);
+                        callError(WRITE_ERROR);
+                        return;
+                    }
+
+                    currentWriteOffset += written;
+                    if (isSendingChunked() && sendingZeroChunk && currentWriteOffset >= currentWriteLen)
+                    {
+                        setState(READING_STATUS);
+                        ESP_HTTPX_LOG('\n');
+                    }
+                }
+            }
+            else if (currentState > WRITING_BODY)
             {
                 ssize_t read = esp_tls_conn_read(handle, dataBuffer, dataBufferSize);
                 if (read == -0x004C) // Reading information from the socket failed
@@ -871,12 +924,87 @@ namespace ESP_HTTPX_CLIENT
             }
         }
 
+        void sendPath(const char *path)
+        {
+            if (path == nullptr || path[0] == 0)
+            {
+                writeUrlEncoded("/", false);
+                return;
+            }
+
+            if (path[0] != '/')
+            {
+                writeUrlEncoded("/", false);
+            }
+
+            writeUrlEncoded(path, false);
+        }
+
+        void sendQueryParam(const char *name, const char *value)
+        {
+            ESP_HTTPX_WRITE_CHECK_VOID(sentFirstQueryParam ? "&" : "?", 1, 0);
+            writeUrlEncoded(name);
+            ESP_HTTPX_WRITE_CHECK_VOID("=", 1, 0);
+            writeUrlEncoded(value);
+            sentFirstQueryParam = true;
+        }
+
+        bool writeUrlEncoded(const char *src, bool uriComponentEncoding = true, unsigned long timeout = 2500)
+        {
+            constexpr char hex[] = "0123456789ABCDEF";
+
+            uint8_t buffer[64];
+            size_t pos = 0;
+
+            auto flush = [&](void) -> bool
+            {
+                if (pos == 0) return true;
+                ESP_HTTPX_WRITE_CHECK(buffer, pos, false, 0);
+                pos = 0;
+                return true;
+            };
+
+            while (*src)
+            {
+                unsigned char c = (unsigned char)*src;
+
+                if (pos + 3 > sizeof(buffer))
+                {
+                    if (!flush()) return false;
+                }
+
+                if (isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~' || (!uriComponentEncoding && c == '/'))
+                {
+                    buffer[pos++] = c;
+                }
+                else if (c == ' ' && uriComponentEncoding)
+                {
+                    buffer[pos++] = '+';
+                }
+                else
+                {
+                    buffer[pos++] = '%';
+                    buffer[pos++] = hex[c >> 4];
+                    buffer[pos++] = hex[c & 0x0F];
+                }
+
+                src++;
+            }
+
+            return flush();
+        }
+
         /**
          * Register callback for client events.
          */
         void onEvent(ESPHttpxClientEventHandler cb)
         {
             eventHandler = cb;
+        }
+
+        void onWriteData(ESPHttpxClientWriteHandler cb)
+        {
+            this->writeHandler = cb;
         }
     private:
 
@@ -892,6 +1020,11 @@ namespace ESP_HTTPX_CLIENT
                 }
             case CONNECTING:
                 {
+                    sentFirstQueryParam = false;
+                    break;
+                }
+            case CONNECTED:
+                {
                     break;
                 }
             case READING_DATA:
@@ -899,10 +1032,15 @@ namespace ESP_HTTPX_CLIENT
                     redirectionCount = 0;
                     break;
                 }
-            case SENDING_BODY:
+            case WRITING_BODY:
                 {
+                    memset(dataBuffer, 0, dataBufferSize);
                     hasRedirection = false;
                     redirectionProcessed = false;
+                    currentWriteTotal = 0;
+                    currentWriteOffset = 0;
+                    currentWriteLen = 0;
+                    sendingZeroChunk = false;
                     break;
                 }
             case READING_STATUS:
@@ -928,7 +1066,7 @@ namespace ESP_HTTPX_CLIENT
             }
         }
 
-        void sendPath(const char *userAgent = "ESP32-HTTPX-CLIENT")
+        void writeHttpLine(const char *userAgent = "ESP32-HTTPX-CLIENT")
         {
             const char *methodStr = methodToString(currentMethod);
             if (methodStr == nullptr || sentPath)
@@ -939,7 +1077,7 @@ namespace ESP_HTTPX_CLIENT
             ESP_HTTPX_LOGN("Sending request line.");
 
             ESP_HTTPX_WRITE_BOTH(methodStr);
-            ESP_HTTPX_WRITE_BOTH(pathLen == 0 ? "/" : path);
+            callCb(SEND_PATH_AND_QUERY_EVENT);
             ESP_HTTPX_WRITE_BOTH(HTTP_VER);
             ESP_HTTPX_WRITE_LN_CHECK_VOID();
 
@@ -961,6 +1099,14 @@ namespace ESP_HTTPX_CLIENT
             return writeWithTimeout((const uint8_t*) data, len, timeout);
         }
 
+        bool hasWriteError(ssize_t result) const
+        {
+            return result < 0 &&
+                result != ESP_TLS_ERR_SSL_WANT_READ &&
+                result != ESP_TLS_ERR_SSL_WANT_WRITE &&
+                (mode != PLAIN_HTTP || result != ESP_HTTPX_CLIENT_TIMEOUT);
+        }
+
         ssize_t writeWithTimeout(const uint8_t *data, size_t len, unsigned long timeout = 2500)
         {
             unsigned long timer = millis();
@@ -979,10 +1125,7 @@ namespace ESP_HTTPX_CLIENT
                     remaining -= sent;
                     timer = millis();
                 }
-                else if (sent < 0 &&
-                    sent != ESP_TLS_ERR_SSL_WANT_READ &&
-                    sent != ESP_TLS_ERR_SSL_WANT_WRITE &&
-                    (mode != PLAIN_HTTP || sent != ESP_HTTPX_CLIENT_TIMEOUT))
+                else if (hasWriteError(sent))
                 {
                     ESP_HTTPX_LOGF("Error writing to socket: 0x%x\n", -sent);
                     return sent;
@@ -1024,6 +1167,9 @@ namespace ESP_HTTPX_CLIENT
                 callError(INVALID_REDIRECT);
                 return;
             }
+
+            const char *pathStart = valueStart;
+            size_t pathLen = valueLen;
 
             const char *protocolSeparator = strnstr(valueStart, "://", valueLen);
             if (protocolSeparator != nullptr)
@@ -1089,11 +1235,47 @@ namespace ESP_HTTPX_CLIENT
                 ESP_HTTPX_LOGW(hostStart, hostLength);
                 ESP_HTTPX_LOG("\n");
                 setHostname(hostStart, hostLength);
+
+                pathStart = (const char*) memchr(hostStart, '/', lenWithoutProtocol);
+                if (pathStart != nullptr)
+                {
+                    pathLen = lenWithoutProtocol - (pathStart - hostStart);
+                    ESP_HTTPX_LOG("New path: ");
+                    ESP_HTTPX_LOGW(pathStart, pathLen);
+                    ESP_HTTPX_LOG('\n');
+                }
             }
 
             redirectionProcessed = true;
-            setPath(valueStart, valueLen, currentMethod, keepAlive); // keep full location as path, some servers need it that way
             redirectionCount++;
+
+            ESPHttpxClientEventHandler oldHandler = eventHandler;
+            onEvent([this, oldHandler, pathStart, pathLen](ESPHttpxClientEvent event, uint8_t* data, size_t len, bool headerTruncated)
+            {
+                if (event == SEND_PATH_AND_QUERY_EVENT)
+                {
+                    // WARNING:
+                    // Path string is only valid here because it points to the currentHeaderBuffer class variable.
+                    // If it was a dynamic buffer this would not work.
+
+                    const char *path = pathStart == nullptr ? "/" : pathStart;
+                    const size_t finalPathLen = pathStart == nullptr ? 1 : pathLen;
+                    writeWithTimeout(path, finalPathLen);
+                    ESP_HTTPX_LOGW(path, finalPathLen);
+                    this->eventHandler = oldHandler;
+                }
+                else if (event > SEND_PATH_AND_QUERY_EVENT)
+                {
+                    callError(INVALID_REDIRECT);
+                    this->eventHandler = oldHandler;
+                }
+                else
+                {
+                    this->eventHandler(event, data, len, headerTruncated);
+                }
+
+            });
+
             cleanup();
             start();
         }
@@ -1106,12 +1288,10 @@ namespace ESP_HTTPX_CLIENT
 
         void callCb(const ESPHttpxClientEvent event, uint8_t *data = nullptr, size_t len = 0, bool truncated = false)
         {
-            bool wasConnected = (currentState == READING_DATA);
-
             if (event == CONNECTION_SUCCESSFUL_EVENT)
             {
-                sendPath();
-                setState(SENDING_BODY);
+                writeHttpLine();
+                setState(CONNECTED);
             }
             else if (event == CONNECTION_FAILED_EVENT || event == REQUEST_FINISHED_EVENT || event == ERROR_EVENT)
             {
@@ -1162,6 +1342,10 @@ namespace ESP_HTTPX_CLIENT
             contentSentLen = 0;
             contentLength = 0;
             isReceivingChunked = false;
+            currentWriteLen = 0;
+            currentWriteOffset = 0;
+            currentWriteTotal = 0;
+            sendingZeroChunk = false;
         }
 
         esp_tls_conn_state_t getTlsState()
@@ -1191,8 +1375,6 @@ namespace ESP_HTTPX_CLIENT
         bool keepAlive;
         bool sentPath;
 
-        char path[maxPathLen];
-        size_t pathLen;
         char hostname[maxHostnameLen];
         size_t hostnameLen;
 
@@ -1202,11 +1384,18 @@ namespace ESP_HTTPX_CLIENT
         ESPHttpxClientEventHandler eventHandler;
         esp_tls_t *handle;
 
+        ESPHttpxClientWriteHandler writeHandler;
+        ssize_t currentWriteLen;
+        size_t currentWriteOffset;
+        size_t currentWriteTotal;
+        bool sendingZeroChunk;
+
         const char *cert;
         size_t certLen;
         esp_tls_cfg_t config;
 
         uint8_t dataBuffer[dataBufferSize];
+        bool sentFirstQueryParam;
 
         size_t headerBufferOffset;
         char currentHeaderBuffer[headerBufferSize];
