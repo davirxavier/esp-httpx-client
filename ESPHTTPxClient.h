@@ -179,7 +179,7 @@ namespace ESP_HTTPX_CLIENT
 
     enum ESPHttpxClientState
     {
-        STOPPED = 0,
+        STOPPED = 0, // WARNING: Maintain element ordering. State machine depends on this order.
         CONNECTING,
         CONNECTED,
         WRITING_BODY,
@@ -194,6 +194,7 @@ namespace ESP_HTTPX_CLIENT
 
     enum ESPHttpxClientEvent
     {
+        SEND_HOSTNAME_EVENT,
         CONNECTION_SUCCESSFUL_EVENT,
         CONNECTION_FAILED_EVENT,
         SEND_PATH_AND_QUERY_EVENT,
@@ -214,6 +215,7 @@ namespace ESP_HTTPX_CLIENT
         INVALID_REDIRECT,
         WRITE_TOO_BIG,
         WRITE_ERROR,
+        INVALID_HOSTNAME,
     };
 
     static const char* HTTP_VER PROGMEM = " HTTP/1.1";
@@ -270,12 +272,11 @@ namespace ESP_HTTPX_CLIENT
         ESPHttpxClient(const ESPHttpxClient&) = delete;
         ESPHttpxClient& operator=(const ESPHttpxClient&) = delete;
 
-        explicit ESPHttpxClient(): hostname{}, dataBuffer{}, currentHeaderBuffer{}
+        explicit ESPHttpxClient(): dataBuffer{}, currentHeaderBuffer{}
         {
             currentMethod = HTTP_GET;
             keepAlive = false;
             sentPath = false;
-            hostnameLen = 0;
             setState(STOPPED);
             eventHandler = nullptr;
             handle = nullptr;
@@ -325,25 +326,6 @@ namespace ESP_HTTPX_CLIENT
         }
 
         /**
-         * Sets the client connection hostname. Max length is defined by maxHostnameLen template parameter;
-         */
-        void setHostname(const char *host)
-        {
-            setHostname(host, strlen(host));
-        }
-
-        /**
-         * Sets the client connection hostname. Max length is defined by maxHostnameLen template parameter;
-         */
-        void setHostname(const char *host, size_t len)
-        {
-            size_t finalLen = min(len, maxHostnameLen-1);
-            memcpy(this->hostname, host, finalLen);
-            this->hostname[finalLen] = 0;
-            hostnameLen = finalLen;
-        }
-
-        /**
          * Connection port;
          * @param port desired port or -1 to use default ports
          */
@@ -366,11 +348,6 @@ namespace ESP_HTTPX_CLIENT
          */
         void start()
         {
-            if (hostnameLen == 0)
-            {
-                return;
-            }
-
             if (isTlsStarted())
             {
                 ESP_HTTPX_LOGN("Tried to connect but connection already started.");
@@ -472,19 +449,7 @@ namespace ESP_HTTPX_CLIENT
         {
             if (handle != nullptr && currentState == CONNECTING)
             {
-                int actualPort = port <= 0 ? (mode == PLAIN_HTTP ? 80 : 443) : port;
-                int res = esp_tls_conn_new_async(hostname, hostnameLen, actualPort, &config, handle);
-
-                if (res == 1)
-                {
-                    ESP_HTTPX_LOGN("Connected succesfully.");
-                    callCb(CONNECTION_SUCCESSFUL_EVENT);
-                }
-                else if (res == -1)
-                {
-                    ESP_HTTPX_LOGN("Connection failed.");
-                    callCb(CONNECTION_FAILED_EVENT);
-                }
+                callCb(SEND_HOSTNAME_EVENT);
             }
 
             if (handle != nullptr && currentState == WRITING_BODY)
@@ -924,6 +889,47 @@ namespace ESP_HTTPX_CLIENT
             }
         }
 
+        void sendHostname(const char *hostname)
+        {
+            sendHostname(hostname, strlen(hostname));
+        }
+
+        void sendHostname(const char *hostname, size_t len)
+        {
+            if (hostname == nullptr || len == 0)
+            {
+                ESP_HTTPX_LOGN("Invalid hostname");
+                callError(INVALID_HOSTNAME);
+                return;
+            }
+
+            if (currentState == CONNECTING)
+            {
+                int actualPort = port <= 0 ? (mode == PLAIN_HTTP ? 80 : 443) : port;
+                int res = esp_tls_conn_new_async(hostname, len, actualPort, &config, handle);
+
+                if (res == 1)
+                {
+                    ESP_HTTPX_LOGN("Connected succesfully.");
+                    callCb(CONNECTION_SUCCESSFUL_EVENT);
+                }
+                else if (res == -1)
+                {
+                    ESP_HTTPX_LOGN("Connection failed.");
+                    callCb(CONNECTION_FAILED_EVENT);
+                }
+            }
+            else
+            {
+                ESP_HTTPX_WRITE_CHECK_VOID(hostname, len, 0);
+            }
+        }
+
+        void setKeepAlive(bool keepAlive)
+        {
+            this->keepAlive = keepAlive;
+        }
+
         void sendPath(const char *path)
         {
             if (path == nullptr || path[0] == 0)
@@ -1082,7 +1088,7 @@ namespace ESP_HTTPX_CLIENT
             ESP_HTTPX_WRITE_LN_CHECK_VOID();
 
             ESP_HTTPX_WRITE_BOTH(HOST_HEADER);
-            ESP_HTTPX_WRITE_BOTH(hostname);
+            callCb(SEND_HOSTNAME_EVENT);
             ESP_HTTPX_WRITE_LN_CHECK_VOID();
 
             ESP_HTTPX_WRITE_BOTH(USER_AGENT_HEADER);
@@ -1172,6 +1178,8 @@ namespace ESP_HTTPX_CLIENT
             size_t pathLen = valueLen;
 
             const char *protocolSeparator = strnstr(valueStart, "://", valueLen);
+            const char *hostStart = nullptr;
+            size_t hostLength = 0;
             if (protocolSeparator != nullptr)
             {
                 size_t protoLen = protocolSeparator - valueStart;
@@ -1189,7 +1197,7 @@ namespace ESP_HTTPX_CLIENT
                     return;
                 }
 
-                const char *hostStart = protocolSeparator+3;
+                hostStart = protocolSeparator+3;
                 const char *hostEnd = (const char*) memchr(hostStart, ':', lenWithoutProtocol);
                 if (hostEnd == nullptr)
                 {
@@ -1224,7 +1232,7 @@ namespace ESP_HTTPX_CLIENT
                     setPort(parsedPort);
                 }
 
-                ssize_t hostLength = hostEnd ? (hostEnd - hostStart) : lenWithoutProtocol;
+                hostLength = hostEnd ? (hostEnd - hostStart) : lenWithoutProtocol;
                 if (hostLength <= 0 || (size_t)hostLength > maxHostnameLen) {
                     ESP_HTTPX_LOGN("Invalid host length.");
                     callError(INVALID_REDIRECT);
@@ -1234,7 +1242,6 @@ namespace ESP_HTTPX_CLIENT
                 ESP_HTTPX_LOG("New hostname: ");
                 ESP_HTTPX_LOGW(hostStart, hostLength);
                 ESP_HTTPX_LOG("\n");
-                setHostname(hostStart, hostLength);
 
                 pathStart = (const char*) memchr(hostStart, '/', lenWithoutProtocol);
                 if (pathStart != nullptr)
@@ -1250,30 +1257,32 @@ namespace ESP_HTTPX_CLIENT
             redirectionCount++;
 
             ESPHttpxClientEventHandler oldHandler = eventHandler;
-            onEvent([this, oldHandler, pathStart, pathLen](ESPHttpxClientEvent event, uint8_t* data, size_t len, bool headerTruncated)
+            onEvent([this, oldHandler, pathStart, pathLen, hostStart, hostLength](ESPHttpxClientEvent event, uint8_t* data, size_t len, bool headerTruncated)
             {
-                if (event == SEND_PATH_AND_QUERY_EVENT)
-                {
-                    // WARNING:
-                    // Path string is only valid here because it points to the currentHeaderBuffer class variable.
-                    // If it was a dynamic buffer this would not work.
+                // WARNING:
+                // Path and host string are only valid here because they point to the currentHeaderBuffer class variable.
+                // If it was a dynamic buffer this would not work.
 
+                if (event == SEND_HOSTNAME_EVENT && (hostStart == nullptr || hostLength <= 0))
+                {
+                    oldHandler(event, data, len, headerTruncated); // call original event if location has no host
+                }
+                else if (event == SEND_HOSTNAME_EVENT)
+                {
+                    sendHostname(hostStart, hostLength);
+                }
+                else if (event == SEND_PATH_AND_QUERY_EVENT)
+                {
                     const char *path = pathStart == nullptr ? "/" : pathStart;
                     const size_t finalPathLen = pathStart == nullptr ? 1 : pathLen;
                     writeWithTimeout(path, finalPathLen);
                     ESP_HTTPX_LOGW(path, finalPathLen);
-                    this->eventHandler = oldHandler;
-                }
-                else if (event > SEND_PATH_AND_QUERY_EVENT)
-                {
-                    callError(INVALID_REDIRECT);
-                    this->eventHandler = oldHandler;
                 }
                 else
                 {
-                    this->eventHandler(event, data, len, headerTruncated);
+                    oldHandler(event, data, len, headerTruncated);
+                    this->eventHandler = oldHandler;
                 }
-
             });
 
             cleanup();
@@ -1290,8 +1299,8 @@ namespace ESP_HTTPX_CLIENT
         {
             if (event == CONNECTION_SUCCESSFUL_EVENT)
             {
-                writeHttpLine();
                 setState(CONNECTED);
+                writeHttpLine();
             }
             else if (event == CONNECTION_FAILED_EVENT || event == REQUEST_FINISHED_EVENT || event == ERROR_EVENT)
             {
@@ -1374,9 +1383,6 @@ namespace ESP_HTTPX_CLIENT
         Method currentMethod;
         bool keepAlive;
         bool sentPath;
-
-        char hostname[maxHostnameLen];
-        size_t hostnameLen;
 
         int port;
         Mode mode;
