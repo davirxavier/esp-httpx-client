@@ -84,6 +84,10 @@ void setup() {
             case SEND_HOSTNAME_EVENT:
                 http.sendHostname("example.com"); // placeholder
                 break;
+                
+            case SEND_METHOD_EVENT:
+                http.sendHttpMethod(Method::HTTP_GET);
+                break;
 
             case SEND_PATH_AND_QUERY_EVENT:
                 http.sendPath("/api/test");
