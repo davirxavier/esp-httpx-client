@@ -1,6 +1,6 @@
 # ESPHttpxClient
 
-C++ HTTP/HTTPS client for ESP32 with optional TLS support, asynchronous operation, and event-driven callbacks.
+HTTP/HTTPS client for ESP32 with optional TLS support, asynchronous operation, and event-driven callbacks.
 
 ---
 
