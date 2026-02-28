@@ -25,29 +25,29 @@
 #define ESP_HTTPX_LOGF(str, p...)
 #endif
 
-#define ESP_HTTPX_WRITE_CHECK(data, len, retval, counter)   \
-        ssize_t _res##counter = 0;                     \
+#define ESP_HTTPX_WRITE_CHECK(data, len, retval)   \
+        ssize_t _res = 0;                     \
         do {                                           \
-            _res##counter = writeWithTimeout(data, len); \
+            _res = writeWithTimeout(data, len); \
             ESP_HTTPX_LOGW((const char*) data, len);     \
-            if (_res##counter < 0) {                   \
-                ESP_HTTPX_LOGF("Write error: 0x%x\n", -(int)_res##counter); \
+            if (_res < 0) {                   \
+                ESP_HTTPX_LOGF("Write error: 0x%x\n", -(int)_res); \
                 return retval;                         \
             }                                          \
         } while(false)
 
-#define ESP_HTTPX_WRITE_CHECK_VOID(data, len, counter)      \
+#define ESP_HTTPX_WRITE_CHECK_VOID(data, len)      \
         do {                                           \
-            ssize_t _res##counter = writeWithTimeout(data, len); \
+            ssize_t _res = writeWithTimeout(data, len); \
             ESP_HTTPX_LOGW((const char*) data, len);     \
-            if (_res##counter < 0) {                   \
-                ESP_HTTPX_LOGF("Write error: 0x%x\n", -(int)_res##counter); \
+            if (_res < 0) {                   \
+                ESP_HTTPX_LOGF("Write error: 0x%x\n", -(int)_res); \
                 return;                                \
             }                                          \
         } while(false)
 
-#define ESP_HTTPX_WRITE_BOTH(str) ESP_HTTPX_WRITE_CHECK_VOID((const uint8_t*) (str), strlen(str), 0)
-#define ESP_HTTPX_WRITE_LN_CHECK_VOID() ESP_HTTPX_WRITE_CHECK_VOID((const uint8_t*) LINE_FEED, LINE_FEED_LEN, 0)
+#define ESP_HTTPX_WRITE_BOTH(str) ESP_HTTPX_WRITE_CHECK_VOID((const uint8_t*) (str), strlen(str))
+#define ESP_HTTPX_WRITE_LN_CHECK_VOID() ESP_HTTPX_WRITE_CHECK_VOID((const uint8_t*) LINE_FEED, LINE_FEED_LEN)
 
 namespace ESP_HTTPX_CLIENT
 {
@@ -202,6 +202,7 @@ namespace ESP_HTTPX_CLIENT
         SEND_HOSTNAME_EVENT,
         CONNECTION_SUCCESSFUL_EVENT,
         CONNECTION_FAILED_EVENT,
+        SEND_METHOD_EVENT,
         SEND_PATH_AND_QUERY_EVENT,
         ERROR_EVENT,
         STATUS_RECEIVED_EVENT,
@@ -228,6 +229,7 @@ namespace ESP_HTTPX_CLIENT
         INVALID_CONTENT_LENGTH,
         INVALID_QUERY_VALUE,
         INCORRECT_BYTES_WRITTEN,
+        INVALID_METHOD,
     };
 
     static const char *HTTP_VER PROGMEM = " HTTP/1.1";
@@ -296,7 +298,6 @@ namespace ESP_HTTPX_CLIENT
 
         explicit ESPHttpxClient(): dataBuffer{}, currentHeaderBuffer{}
         {
-            currentMethod = HTTP_GET;
             keepAlive = false;
             setState(STOPPED);
             eventHandler = nullptr;
@@ -319,6 +320,8 @@ namespace ESP_HTTPX_CLIENT
             currentWriteLen = 0;
             currentWriteOffset = 0;
             receivingContentLength = 0;
+            taskHandle = nullptr;
+            taskRunning = false;
 
             for (size_t i = 0; i < TERMINATORS_COUNT; i++)
             {
@@ -463,7 +466,7 @@ namespace ESP_HTTPX_CLIENT
         {
             if (isSendingChunked())
             {
-                ESP_HTTPX_WRITE_CHECK_VOID(END_CHUNK_MARKER, END_CHUNK_MARKER_LEN, 0);
+                ESP_HTTPX_WRITE_CHECK_VOID(END_CHUNK_MARKER, END_CHUNK_MARKER_LEN);
                 setState(READING_STATUS);
             }
         }
@@ -485,7 +488,7 @@ namespace ESP_HTTPX_CLIENT
 
             if (handle != nullptr && currentState == WRITING_BODY)
             {
-                if (writeHandler == nullptr)
+                if (writeHandler == nullptr || contentLength == 0)
                 {
                     setState(READING_STATUS);
                     return;
@@ -970,7 +973,7 @@ namespace ESP_HTTPX_CLIENT
             }
             else
             {
-                ESP_HTTPX_WRITE_CHECK_VOID(hostname, len, 0);
+                ESP_HTTPX_WRITE_CHECK_VOID(hostname, len);
             }
         }
 
@@ -981,6 +984,18 @@ namespace ESP_HTTPX_CLIENT
         void setKeepAlive(bool keepAlive)
         {
             this->keepAlive = keepAlive;
+        }
+
+        void sendHttpMethod(Method method)
+        {
+            const char *methodStr = methodToString(method);
+            if (methodStr == nullptr)
+            {
+                ESP_HTTPX_LOGN("Invalid HTTP method.");
+                callError(INVALID_METHOD);
+                return;
+            }
+            ESP_HTTPX_WRITE_BOTH(methodStr);
         }
 
         /**
@@ -1024,9 +1039,9 @@ namespace ESP_HTTPX_CLIENT
         */
         void sendQueryParam(const char *name, const char *value)
         {
-            ESP_HTTPX_WRITE_CHECK_VOID(sentFirstQueryParam ? "&" : "?", 1, 0);
+            ESP_HTTPX_WRITE_CHECK_VOID(sentFirstQueryParam ? "&" : "?", 1);
             writeUrlEncoded(name);
-            ESP_HTTPX_WRITE_CHECK_VOID("=", 1, 0);
+            ESP_HTTPX_WRITE_CHECK_VOID("=", 1);
             writeUrlEncoded(value);
             sentFirstQueryParam = true;
         }
@@ -1041,7 +1056,7 @@ namespace ESP_HTTPX_CLIENT
             auto flush = [&](void) -> bool
             {
                 if (pos == 0) return true;
-                ESP_HTTPX_WRITE_CHECK(buffer, pos, false, 0);
+                ESP_HTTPX_WRITE_CHECK(buffer, pos, false);
                 pos = 0;
                 return true;
             };
@@ -1162,15 +1177,8 @@ namespace ESP_HTTPX_CLIENT
 
         void writeHttpLine(const char *userAgent = "ESP32-HTTPX-CLIENT")
         {
-            const char *methodStr = methodToString(currentMethod);
-            if (methodStr == nullptr)
-            {
-                return;
-            }
-
             ESP_HTTPX_LOGN("Sending request line.");
-
-            ESP_HTTPX_WRITE_BOTH(methodStr);
+            callCb(SEND_METHOD_EVENT);
             callCb(SEND_PATH_AND_QUERY_EVENT);
             ESP_HTTPX_WRITE_BOTH(HTTP_VER);
             ESP_HTTPX_WRITE_LN_CHECK_VOID();
@@ -1508,7 +1516,45 @@ namespace ESP_HTTPX_CLIENT
             return state == ESP_TLS_DONE || state == ESP_TLS_HANDSHAKE || state == ESP_TLS_CONNECTING;
         }
 
-        Method currentMethod;
+        void startTask(uint32_t stackSize = 8192, UBaseType_t priority = 1)
+        {
+            if (taskRunning) return;
+
+            taskRunning = true;
+
+            xTaskCreate(
+                taskEntry,
+                "ESPHttpxClientTask",
+                stackSize,
+                this,
+                priority,
+                &taskHandle
+            );
+        }
+
+        void stopTask()
+        {
+            taskRunning = false;
+            taskHandle = nullptr;
+        }
+
+        static void taskEntry(void* param)
+        {
+            auto* client = static_cast<ESPHttpxClient*>(param);
+
+            while (client->taskRunning)
+            {
+                client->loop();
+                vTaskDelay(3);
+            }
+
+            vTaskDelete(nullptr);
+        }
+
+        SemaphoreHandle_t mutex;
+        TaskHandle_t taskHandle;
+        bool taskRunning;
+
         bool keepAlive;
 
         int port;
