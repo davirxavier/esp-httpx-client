@@ -209,6 +209,13 @@ namespace ESP_HTTPX_CLIENT
         INVALID_METHOD,
     };
 
+    enum EncodingType
+    {
+        HTTPX_NO_ENCODING,
+        HTTPX_URL_ENCODING,          // Path-safe (keeps / : @ etc.)
+        HTTPX_URI_COMPONENT_ENCODING // Strict (encodes everything except alphanumeric/unreserved)
+    };
+
     static const char *HTTP_VER PROGMEM = " HTTP/1.1";
     static const char *CONTENT_LENGTH_HEADER PROGMEM = "Content-Length";
     static const size_t CONTENT_LENGTH_HEADER_LEN = 14;
@@ -431,11 +438,6 @@ namespace ESP_HTTPX_CLIENT
             cleanup();
         }
 
-        size_t calcMaximumBodyWriteLen()
-        {
-            return dataBufferSize - 64;
-        }
-
         void sendBodyData(const uint8_t *data, size_t len)
         {
             size_t maxBodyLen = calcMaximumBodyWriteLen();
@@ -555,7 +557,6 @@ namespace ESP_HTTPX_CLIENT
                 bodyWriteIndex += written;
                 currentWriteOffset += written;
                 currentWriteLen -= written;
-                ESP_HTTPX_LOGF("Written %lu bytes to body, %lu remaining\n", written, currentWriteLen);
             }
             else if (currentState > WRITING_BODY)
             {
@@ -983,7 +984,7 @@ namespace ESP_HTTPX_CLIENT
         /**
          * Sends the request path.
          */
-        void sendPath(const char *path) // TODO url encoding
+        void sendPath(const char *path)
         {
             if (path == nullptr || path[0] == 0)
             {
@@ -996,7 +997,7 @@ namespace ESP_HTTPX_CLIENT
                 queueWrite("/", 1);
             }
 
-            queueWrite(path);
+            queueWrite(path, HTTPX_URL_ENCODING);
         }
 
         /**
@@ -1022,11 +1023,10 @@ namespace ESP_HTTPX_CLIENT
         void sendQueryParam(const char *name, const char *value)
         {
             queueWrite(sentFirstQueryParam ? "&" : "?", 1);
-            queueWrite(name);
+            queueWrite(name, strlen(name), HTTPX_URI_COMPONENT_ENCODING);
             queueWrite("=", 1);
-            queueWrite(value);
-            // sentFirstQueryParam = true;
-            // TODO sent first
+            queueWrite(value, strlen(value), HTTPX_URI_COMPONENT_ENCODING);
+            sentFirstQueryParam = true;
         }
 
         /**
@@ -1054,79 +1054,82 @@ namespace ESP_HTTPX_CLIENT
         }
     private:
 
+        size_t calcMaximumBodyWriteLen()
+        {
+            return dataBufferSize - (isSendingChunked() ? 36 : 0); // 32 for chunk header + 2 for chunk end \r\n + 2 for ease of mind
+        }
+
         void resetQueueWrite()
         {
             streamLength = 0;
         }
 
-        void queueWrite(const uint8_t* data, size_t len, bool encodeUrl = false)
+        bool isQueueWriteDone() const
         {
-            if (!data || len == 0)
-                return;
-
-            size_t segmentStart = streamLength;
-            size_t segmentEnd   = segmentStart + len;
-
-            streamLength = segmentEnd;
-
-            /* Reset buffer if fully sent */
-            if (currentWriteOffset >= currentWriteLen)
-            {
-                currentWriteOffset = 0;
-                currentWriteLen = 0;
-            }
-
-            /* Compact unsent data */
-            if (currentWriteOffset > 0)
-            {
-                size_t unsent = currentWriteLen - currentWriteOffset;
-
-                if (unsent > 0)
-                    memmove(dataBuffer, dataBuffer + currentWriteOffset, unsent);
-
-                currentWriteLen = unsent;
-                currentWriteOffset = 0;
-            }
-
-            /* Entire segment already sent */
-            if (streamCursor >= segmentEnd)
-                return;
-
-            size_t localOffset = 0;
-
-            size_t effectiveCursor =
-                streamCursor +
-                (currentWriteLen - currentWriteOffset);
-
-            if (effectiveCursor > segmentStart)
-                localOffset = effectiveCursor - segmentStart;
-
-            if (localOffset > len)
-                localOffset = len;
-
-            size_t remaining = len - localOffset;
-
-            size_t freeSpace = dataBufferSize - currentWriteLen;
-            if (freeSpace == 0)
-                return;
-
-            size_t toCopy = (remaining < freeSpace) ? remaining : freeSpace;
-
-            memcpy(dataBuffer + currentWriteLen,
-                   data + localOffset,
-                   toCopy);
-
-            currentWriteLen += toCopy;
+            return (streamLength > 0) && (streamCursor >= streamLength) && (currentWriteLen == 0);
         }
 
-        void queueWrite(const char *data, size_t len)
+        void pushByte(uint8_t c)
         {
-            queueWrite(reinterpret_cast<const uint8_t*>(data), len);
+            if (streamLength < streamCursor + currentWriteLen)
+            {
+                streamLength++;
+                return;
+            }
+
+            if (currentWriteLen < dataBufferSize)
+            {
+                dataBuffer[currentWriteLen++] = c;
+            }
+
+            streamLength++;
         }
 
-        void queueWrite(const char *data)
+        void queueWrite(const uint8_t* data, size_t len, EncodingType encoding = HTTPX_NO_ENCODING)
         {
-            queueWrite(data, strlen(data));
+            if (!data || len == 0) return;
+
+            for (size_t i = 0; i < len; i++)
+            {
+                uint8_t c = data[i];
+
+                if (encoding == HTTPX_NO_ENCODING) {
+                    pushByte(c);
+                    continue;
+                }
+
+                if ((c >= '0' && c <= '9') ||
+                    (c >= 'A' && c <= 'Z') ||
+                    (c >= 'a' && c <= 'z') ||
+                    c == '-' || c == '_' || c == '.' || c == '~')
+                {
+                    pushByte(c);
+                }
+                else if (encoding == HTTPX_URL_ENCODING &&
+                        (c == '/' || c == ':' || c == '@' || c == '!' || c == '$' || c == '&' ||
+                         c == '\'' || c == '(' || c == ')' || c == '*' || c == '+' || c == ',' ||
+                         c == ';' || c == '='))
+                {
+                    pushByte(c);
+                }
+                else
+                {
+                    static const char hex[] = "0123456789ABCDEF";
+                    pushByte('%');
+                    pushByte(hex[(c >> 4) & 0xF]);
+                    pushByte(hex[c & 0xF]);
+                }
+            }
+        }
+
+        void queueWrite(const char *data, size_t len, EncodingType encoding = HTTPX_NO_ENCODING)
+        {
+            queueWrite((const uint8_t*) data, len, encoding);
+        }
+
+        void queueWrite(const char *data, EncodingType encoding = HTTPX_NO_ENCODING)
+        {
+            queueWrite(data, strlen(data), encoding);
         }
 
         void setState(ESPHttpxClientState newState)
@@ -1196,7 +1199,6 @@ namespace ESP_HTTPX_CLIENT
 
         void writeHttpLine(const char *userAgent = "ESP32-HTTPX-CLIENT")
         {
-            ESP_HTTPX_LOGN("Sending request line.");
             callCb(SEND_METHOD_EVENT);
 
             sentFirstQueryParam = false;
