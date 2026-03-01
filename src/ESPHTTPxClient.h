@@ -25,30 +25,6 @@
 #define ESP_HTTPX_LOGF(str, p...)
 #endif
 
-#define ESP_HTTPX_WRITE_CHECK(data, len, retval)   \
-        ssize_t _res = 0;                     \
-        do {                                           \
-            _res = writeWithTimeout(data, len); \
-            ESP_HTTPX_LOGW((const char*) data, len);     \
-            if (_res < 0) {                   \
-                ESP_HTTPX_LOGF("Write error: 0x%x\n", -(int)_res); \
-                return retval;                         \
-            }                                          \
-        } while(false)
-
-#define ESP_HTTPX_WRITE_CHECK_VOID(data, len)      \
-        do {                                           \
-            ssize_t _res = writeWithTimeout(data, len); \
-            ESP_HTTPX_LOGW((const char*) data, len);     \
-            if (_res < 0) {                   \
-                ESP_HTTPX_LOGF("Write error: 0x%x\n", -(int)_res); \
-                return;                                \
-            }                                          \
-        } while(false)
-
-#define ESP_HTTPX_WRITE_BOTH(str) ESP_HTTPX_WRITE_CHECK_VOID((const uint8_t*) (str), strlen(str))
-#define ESP_HTTPX_WRITE_LN_CHECK_VOID() ESP_HTTPX_WRITE_CHECK_VOID((const uint8_t*) LINE_FEED, LINE_FEED_LEN)
-
 namespace ESP_HTTPX_CLIENT
 {
     typedef enum {
@@ -182,7 +158,7 @@ namespace ESP_HTTPX_CLIENT
     {
         STOPPED = 0,
         CONNECTING,
-        CONNECTED,
+        WRITING_HTTP_REQUEST,
         WRITING_BODY,
         READING_STATUS,
         READING_HEADERS,
@@ -204,6 +180,7 @@ namespace ESP_HTTPX_CLIENT
         CONNECTION_FAILED_EVENT,
         SEND_METHOD_EVENT,
         SEND_PATH_AND_QUERY_EVENT,
+        SEND_USER_HEADERS_EVENT,
         ERROR_EVENT,
         STATUS_RECEIVED_EVENT,
         HEADER_RECEIVED_EVENT,
@@ -275,7 +252,7 @@ namespace ESP_HTTPX_CLIENT
      * @param index The write index; prefer writing relative to this index if possible.
      * @returns The number of bytes written, or a value <= 0 to indicate no more data.
      */
-    using ESPHttpxClientWriteHandler = std::function<ssize_t(uint8_t *buffer, size_t bufferSize, size_t index)>;
+    using ESPHttpxClientWriteHandler = std::function<void(size_t bufferSize, size_t index)>;
 
 
     /**
@@ -317,11 +294,11 @@ namespace ESP_HTTPX_CLIENT
             redirectionCount = 0;
             maxRedirections = 5;
             writeHandler = nullptr;
+            streamCursor = 0;
+            streamLength = 0;
             currentWriteLen = 0;
             currentWriteOffset = 0;
             receivingContentLength = 0;
-            taskHandle = nullptr;
-            taskRunning = false;
 
             for (size_t i = 0; i < TERMINATORS_COUNT; i++)
             {
@@ -409,10 +386,10 @@ namespace ESP_HTTPX_CLIENT
          */
         void sendHeader(const char *name, const char *value)
         {
-            ESP_HTTPX_WRITE_BOTH(name);
-            ESP_HTTPX_WRITE_BOTH(HEADER_SEPARATOR);
-            ESP_HTTPX_WRITE_BOTH(value);
-            ESP_HTTPX_WRITE_LN_CHECK_VOID();
+            queueWrite(name);
+            queueWrite(": ", 2);
+            queueWrite(value);
+            queueWrite("\r\n", 2);
         }
 
         /**
@@ -429,18 +406,13 @@ namespace ESP_HTTPX_CLIENT
                 char numBuf[32]{};
                 snprintf(numBuf, sizeof(numBuf), "%lu", length);
                 sendHeader(CONTENT_LENGTH_HEADER, numBuf);
-
-                if (length == 0)
-                {
-                    setState(READING_STATUS);
-                }
             }
             else
             {
                 sendHeader(TRANSFER_ENCODING_HEADER, CHUNKED_HEADER);
             }
 
-            ESP_HTTPX_WRITE_LN_CHECK_VOID();
+            queueWrite("\r\n", 2);
         }
 
         /**
@@ -452,31 +424,52 @@ namespace ESP_HTTPX_CLIENT
         }
 
         /**
-         * Begin writing the HTTP request body.
-         */
-        void startBody()
-        {
-            setState(WRITING_BODY);
-        }
-
-        /**
-         * Ends a chunked transfer body.
-         */
-        void endChunkedBody()
-        {
-            if (isSendingChunked())
-            {
-                ESP_HTTPX_WRITE_CHECK_VOID(END_CHUNK_MARKER, END_CHUNK_MARKER_LEN);
-                setState(READING_STATUS);
-            }
-        }
-
-        /**
          * Closes the request and cleans up the connection.
          */
         void close()
         {
             cleanup();
+        }
+
+        size_t calcMaximumBodyWriteLen()
+        {
+            return dataBufferSize - 64;
+        }
+
+        void sendBodyData(const uint8_t *data, size_t len)
+        {
+            size_t maxBodyLen = calcMaximumBodyWriteLen();
+            if (len > maxBodyLen)
+            {
+                ESP_HTTPX_LOGF("Error writing too body, chunk too big, maximum is: %lu\n", maxBodyLen);
+                callError(WRITE_ERROR);
+                return;
+            }
+
+            if (len == 0 || data == nullptr)
+            {
+                if (isSendingChunked())
+                {
+                    queueWrite("0\r\n\r\n", 5);
+                }
+
+                sendingZeroChunk = true;
+                return;
+            }
+
+            if (isSendingChunked())
+            {
+                char buf[32]{};
+                snprintf(buf, sizeof(buf), "%x\r\n", len);
+                queueWrite(buf, strlen(buf));
+            }
+
+            queueWrite(data, len);
+
+            if (isSendingChunked())
+            {
+                queueWrite("\r\n", 2);
+            }
         }
 
         void loop()
@@ -486,94 +479,83 @@ namespace ESP_HTTPX_CLIENT
                 callCb(SEND_HOSTNAME_EVENT);
             }
 
-            if (handle != nullptr && currentState == WRITING_BODY)
+            if (handle != nullptr && currentState == WRITING_HTTP_REQUEST)
             {
-                if (writeHandler == nullptr || contentLength == 0)
+                resetQueueWrite();
+                writeHttpLine();
+
+                size_t available = currentWriteLen;
+                if (available > 0)
+                {
+                    size_t toWrite = min(available, dataBufferSize);
+                    ESP_HTTPX_LOGW(dataBuffer, toWrite);
+                    ssize_t written = esp_tls_conn_write(handle, dataBuffer, toWrite);
+                    if (hasWriteError(written))
+                    {
+                        ESP_HTTPX_LOGF("Write error: %x\n", written);
+                        callError(WRITE_ERROR);
+                        return;
+                    }
+
+                    size_t remaining = currentWriteLen - written;
+                    if (remaining > 0)
+                    {
+                        memmove(dataBuffer, dataBuffer + written, remaining);
+                    }
+
+                    currentWriteLen = remaining;
+                    streamCursor += written;
+                }
+
+                if (streamCursor >= streamLength)
+                {
+                    setState(WRITING_BODY);
+                }
+            }
+            else if (currentState == WRITING_BODY)
+            {
+                if (contentLength == 0)
                 {
                     setState(READING_STATUS);
                     return;
                 }
 
-                if (currentWriteOffset >= currentWriteLen)
+                if (writeHandler == nullptr)
                 {
-                    static constexpr size_t chunkHeaderMaxLen = 30;
+                    ESP_HTTPX_LOGN("Write handler for body not set.");
+                    callError(WRITE_ERROR);
+                    return;
+                }
 
-                    uint8_t *actualBuffer = isSendingChunked() ? dataBuffer + chunkHeaderMaxLen : dataBuffer; // reserve space for chunk size and crlf
-                    size_t actualBufferLen = isSendingChunked() ? dataBufferSize-chunkHeaderMaxLen-2 : dataBufferSize; // reserve space for chunk end crlf
+                if (currentWriteLen == 0)
+                {
+                    if (sendingZeroChunk)
+                    {
+                        setState(READING_STATUS);
+                        return;
+                    }
 
-                    currentWriteLen = writeHandler(actualBuffer, actualBufferLen, currentWriteTotal);
-                    currentWriteTotal += currentWriteLen;
+                    resetQueueWrite();
+                    writeHandler(calcMaximumBodyWriteLen(), bodyWriteIndex);
                     currentWriteOffset = 0;
-
-                    if (currentWriteLen > actualBufferLen)
-                    {
-                        ESP_HTTPX_LOGN("Body data buffer overflow.");
-                        callError(WRITE_TOO_BIG);
-                        return;
-                    }
-
-                    if (isSendingChunked() && currentWriteLen > 0)
-                    {
-                        char chunkSizeBuf[chunkHeaderMaxLen + 1]{};
-                        snprintf(chunkSizeBuf, sizeof(chunkSizeBuf), "%x\r\n", currentWriteLen);
-                        size_t chunkSizeLen = strlen(chunkSizeBuf);
-                        if (chunkSizeLen > chunkHeaderMaxLen)
-                        {
-                            ESP_HTTPX_LOGN("Chunk header buffer overflow.");
-                            callError(WRITE_TOO_BIG);
-                            return;
-                        }
-
-                        uint8_t *headerStart = actualBuffer-chunkSizeLen;
-                        memcpy(headerStart, chunkSizeBuf, chunkSizeLen);
-
-                        actualBuffer[currentWriteLen] = '\r';
-                        actualBuffer[currentWriteLen+1] = '\n';
-
-                        currentWriteLen += chunkSizeLen + 2;
-                        memmove(dataBuffer, headerStart, currentWriteLen);
-                    }
-
-                    if (currentWriteLen <= 0)
-                    {
-                        if (isSendingChunked())
-                        {
-                            sendingZeroChunk = true;
-                            memcpy(dataBuffer, "0\r\n\r\n", 5);
-                            currentWriteLen = 5;
-                            currentWriteOffset = 0;
-                            return;
-                        }
-                        else if (currentWriteTotal != contentLength)
-                        {
-                            ESP_HTTPX_LOGF("Incorrect number of bytes written to body: %lu, expected %lu\n", currentWriteTotal, contentLength);
-                            callError(INCORRECT_BYTES_WRITTEN);
-                            return;
-                        }
-
-                        setState(READING_STATUS);
-                        ESP_HTTPX_LOG('\n');
-                    }
+                    return;
                 }
-                else
+
+                ssize_t written = esp_tls_conn_write(handle, dataBuffer + currentWriteOffset, currentWriteLen);
+                if (hasWriteError(written))
                 {
-                    ssize_t written = esp_tls_conn_write(handle, dataBuffer + currentWriteOffset, currentWriteLen - currentWriteOffset); // TODO handle 0 writes
-                    ESP_HTTPX_LOGW(dataBuffer + currentWriteOffset, currentWriteLen - currentWriteOffset);
-
-                    if (hasWriteError(written))
-                    {
-                        ESP_HTTPX_LOGF("Error writing to body: 0x%x\n", written);
-                        callError(WRITE_ERROR);
-                        return;
-                    }
-
-                    currentWriteOffset += written;
-                    if (isSendingChunked() && sendingZeroChunk && currentWriteOffset >= currentWriteLen)
-                    {
-                        setState(READING_STATUS);
-                        ESP_HTTPX_LOG('\n');
-                    }
+                    ESP_HTTPX_LOGF("Write error: %x\n", written);
+                    callError(WRITE_ERROR);
+                    return;
                 }
+
+                ESP_HTTPX_LOGW(dataBuffer + currentWriteOffset, currentWriteLen);
+                ESP_HTTPX_LOG('\n');
+
+                bodyWriteIndex += written;
+                currentWriteOffset += written;
+                currentWriteLen -= written;
+                ESP_HTTPX_LOGF("Written %lu bytes to body, %lu remaining\n", written, currentWriteLen);
             }
             else if (currentState > WRITING_BODY)
             {
@@ -973,7 +955,7 @@ namespace ESP_HTTPX_CLIENT
             }
             else
             {
-                ESP_HTTPX_WRITE_CHECK_VOID(hostname, len);
+                queueWrite(hostname, len);
             }
         }
 
@@ -995,26 +977,26 @@ namespace ESP_HTTPX_CLIENT
                 callError(INVALID_METHOD);
                 return;
             }
-            ESP_HTTPX_WRITE_BOTH(methodStr);
+            queueWrite(methodStr);
         }
 
         /**
          * Sends the request path.
          */
-        void sendPath(const char *path)
+        void sendPath(const char *path) // TODO url encoding
         {
             if (path == nullptr || path[0] == 0)
             {
-                writeUrlEncoded("/", false);
+                queueWrite("/", 1);
                 return;
             }
 
             if (path[0] != '/')
             {
-                writeUrlEncoded("/", false);
+                queueWrite("/", 1);
             }
 
-            writeUrlEncoded(path, false);
+            queueWrite(path);
         }
 
         /**
@@ -1039,56 +1021,12 @@ namespace ESP_HTTPX_CLIENT
         */
         void sendQueryParam(const char *name, const char *value)
         {
-            ESP_HTTPX_WRITE_CHECK_VOID(sentFirstQueryParam ? "&" : "?", 1);
-            writeUrlEncoded(name);
-            ESP_HTTPX_WRITE_CHECK_VOID("=", 1);
-            writeUrlEncoded(value);
-            sentFirstQueryParam = true;
-        }
-
-        bool writeUrlEncoded(const char *src, bool uriComponentEncoding = true, unsigned long timeout = 2500)
-        {
-            constexpr char hex[] = "0123456789ABCDEF";
-
-            uint8_t buffer[64];
-            size_t pos = 0;
-
-            auto flush = [&](void) -> bool
-            {
-                if (pos == 0) return true;
-                ESP_HTTPX_WRITE_CHECK(buffer, pos, false);
-                pos = 0;
-                return true;
-            };
-
-            while (*src)
-            {
-                unsigned char c = (unsigned char)*src;
-
-                if (pos + 3 > sizeof(buffer))
-                {
-                    if (!flush()) return false;
-                }
-
-                if (isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~' || (!uriComponentEncoding && c == '/'))
-                {
-                    buffer[pos++] = c;
-                }
-                else if (c == ' ' && uriComponentEncoding)
-                {
-                    buffer[pos++] = '+';
-                }
-                else
-                {
-                    buffer[pos++] = '%';
-                    buffer[pos++] = hex[c >> 4];
-                    buffer[pos++] = hex[c & 0x0F];
-                }
-
-                src++;
-            }
-
-            return flush();
+            queueWrite(sentFirstQueryParam ? "&" : "?", 1);
+            queueWrite(name);
+            queueWrite("=", 1);
+            queueWrite(value);
+            // sentFirstQueryParam = true;
+            // TODO sent first
         }
 
         /**
@@ -1116,6 +1054,81 @@ namespace ESP_HTTPX_CLIENT
         }
     private:
 
+        void resetQueueWrite()
+        {
+            streamLength = 0;
+        }
+
+        void queueWrite(const uint8_t* data, size_t len, bool encodeUrl = false)
+        {
+            if (!data || len == 0)
+                return;
+
+            size_t segmentStart = streamLength;
+            size_t segmentEnd   = segmentStart + len;
+
+            streamLength = segmentEnd;
+
+            /* Reset buffer if fully sent */
+            if (currentWriteOffset >= currentWriteLen)
+            {
+                currentWriteOffset = 0;
+                currentWriteLen = 0;
+            }
+
+            /* Compact unsent data */
+            if (currentWriteOffset > 0)
+            {
+                size_t unsent = currentWriteLen - currentWriteOffset;
+
+                if (unsent > 0)
+                    memmove(dataBuffer, dataBuffer + currentWriteOffset, unsent);
+
+                currentWriteLen = unsent;
+                currentWriteOffset = 0;
+            }
+
+            /* Entire segment already sent */
+            if (streamCursor >= segmentEnd)
+                return;
+
+            size_t localOffset = 0;
+
+            size_t effectiveCursor =
+                streamCursor +
+                (currentWriteLen - currentWriteOffset);
+
+            if (effectiveCursor > segmentStart)
+                localOffset = effectiveCursor - segmentStart;
+
+            if (localOffset > len)
+                localOffset = len;
+
+            size_t remaining = len - localOffset;
+
+            size_t freeSpace = dataBufferSize - currentWriteLen;
+            if (freeSpace == 0)
+                return;
+
+            size_t toCopy = (remaining < freeSpace) ? remaining : freeSpace;
+
+            memcpy(dataBuffer + currentWriteLen,
+                   data + localOffset,
+                   toCopy);
+
+            currentWriteLen += toCopy;
+        }
+
+        void queueWrite(const char *data, size_t len)
+        {
+            queueWrite(reinterpret_cast<const uint8_t*>(data), len);
+        }
+
+        void queueWrite(const char *data)
+        {
+            queueWrite(data, strlen(data));
+        }
+
         void setState(ESPHttpxClientState newState)
         {
             currentState = newState;
@@ -1131,14 +1144,13 @@ namespace ESP_HTTPX_CLIENT
                     sentFirstQueryParam = false;
                     break;
                 }
-            case CONNECTED:
+            case WRITING_HTTP_REQUEST:
                 {
                     sentFirstQueryParam = false;
-                    break;
-                }
-            case READING_DATA:
-                {
-                    redirectionCount = 0;
+                    streamCursor = 0;
+                    streamLength = 0;
+                    currentWriteOffset = 0;
+                    currentWriteLen = 0;
                     break;
                 }
             case WRITING_BODY:
@@ -1146,10 +1158,12 @@ namespace ESP_HTTPX_CLIENT
                     memset(dataBuffer, 0, dataBufferSize);
                     hasRedirection = false;
                     redirectionProcessed = false;
-                    currentWriteTotal = 0;
+                    streamCursor = 0;
+                    streamLength = 0;
                     currentWriteOffset = 0;
                     currentWriteLen = 0;
                     sendingZeroChunk = false;
+                    bodyWriteIndex = 0;
                     break;
                 }
             case READING_STATUS:
@@ -1158,6 +1172,11 @@ namespace ESP_HTTPX_CLIENT
                     headerBufferOffset = 0;
                     memset(currentHeaderBuffer, 0, headerBufferSize);
                     memset(terminatorMatchCounts, 0, sizeof(terminatorMatchCounts));
+                    break;
+                }
+            case READING_DATA:
+                {
+                    redirectionCount = 0;
                     break;
                 }
             case READING_CHUNK_DATA:
@@ -1179,20 +1198,25 @@ namespace ESP_HTTPX_CLIENT
         {
             ESP_HTTPX_LOGN("Sending request line.");
             callCb(SEND_METHOD_EVENT);
+
+            sentFirstQueryParam = false;
             callCb(SEND_PATH_AND_QUERY_EVENT);
-            ESP_HTTPX_WRITE_BOTH(HTTP_VER);
-            ESP_HTTPX_WRITE_LN_CHECK_VOID();
 
-            ESP_HTTPX_WRITE_BOTH(HOST_HEADER);
+            queueWrite(HTTP_VER);
+            queueWrite(LINE_FEED, LINE_FEED_LEN);
+
+            queueWrite(HOST_HEADER);
             callCb(SEND_HOSTNAME_EVENT);
-            ESP_HTTPX_WRITE_LN_CHECK_VOID();
+            queueWrite(LINE_FEED, LINE_FEED_LEN);
 
-            ESP_HTTPX_WRITE_BOTH(USER_AGENT_HEADER);
-            ESP_HTTPX_WRITE_BOTH(userAgent);
-            ESP_HTTPX_WRITE_LN_CHECK_VOID();
+            queueWrite(USER_AGENT_HEADER);
+            queueWrite(userAgent);
+            queueWrite(LINE_FEED, LINE_FEED_LEN);
 
-            ESP_HTTPX_WRITE_BOTH(keepAlive ? CONNECTION_KEEP_HEADER : CONNECTION_CLOSE_HEADER);
-            ESP_HTTPX_WRITE_LN_CHECK_VOID();
+            queueWrite(keepAlive ? CONNECTION_KEEP_HEADER : CONNECTION_CLOSE_HEADER);
+            queueWrite(LINE_FEED, LINE_FEED_LEN);
+
+            callCb(SEND_USER_HEADERS_EVENT);
         }
 
         ssize_t writeWithTimeout(const char *data, size_t len, unsigned long timeout = 2500)
@@ -1424,8 +1448,7 @@ namespace ESP_HTTPX_CLIENT
         {
             if (event == CONNECTION_SUCCESSFUL_EVENT)
             {
-                setState(CONNECTED);
-                writeHttpLine();
+                setState(WRITING_HTTP_REQUEST);
             }
             else if (event == CONNECTION_FAILED_EVENT || event == CONNECTION_CLOSED_EVENT || event == ERROR_EVENT)
             {
@@ -1486,9 +1509,10 @@ namespace ESP_HTTPX_CLIENT
             contentSentLen = 0;
             contentLength = 0;
             isReceivingChunked = false;
+            streamCursor = 0;
+            streamLength = 0;
             currentWriteLen = 0;
             currentWriteOffset = 0;
-            currentWriteTotal = 0;
             sendingZeroChunk = false;
             receivingContentLength = 0;
         }
@@ -1516,45 +1540,6 @@ namespace ESP_HTTPX_CLIENT
             return state == ESP_TLS_DONE || state == ESP_TLS_HANDSHAKE || state == ESP_TLS_CONNECTING;
         }
 
-        void startTask(uint32_t stackSize = 8192, UBaseType_t priority = 1)
-        {
-            if (taskRunning) return;
-
-            taskRunning = true;
-
-            xTaskCreate(
-                taskEntry,
-                "ESPHttpxClientTask",
-                stackSize,
-                this,
-                priority,
-                &taskHandle
-            );
-        }
-
-        void stopTask()
-        {
-            taskRunning = false;
-            taskHandle = nullptr;
-        }
-
-        static void taskEntry(void* param)
-        {
-            auto* client = static_cast<ESPHttpxClient*>(param);
-
-            while (client->taskRunning)
-            {
-                client->loop();
-                vTaskDelay(3);
-            }
-
-            vTaskDelete(nullptr);
-        }
-
-        SemaphoreHandle_t mutex;
-        TaskHandle_t taskHandle;
-        bool taskRunning;
-
         bool keepAlive;
 
         int port;
@@ -1563,17 +1548,20 @@ namespace ESP_HTTPX_CLIENT
         ESPHttpxClientEventHandler eventHandler;
         esp_tls_t *handle;
 
-        ESPHttpxClientWriteHandler writeHandler;
-        ssize_t currentWriteLen;
-        size_t currentWriteOffset;
-        size_t currentWriteTotal;
-        bool sendingZeroChunk;
 
         const char *cert;
         size_t certLen;
         esp_tls_cfg_t config;
 
+        ESPHttpxClientWriteHandler writeHandler;
         uint8_t dataBuffer[dataBufferSize];
+        size_t streamCursor;
+        size_t streamLength;
+        size_t currentWriteLen;
+        size_t currentWriteOffset;
+        size_t bodyWriteIndex;
+
+        bool sendingZeroChunk;
         bool sentFirstQueryParam;
 
         size_t headerBufferOffset;
