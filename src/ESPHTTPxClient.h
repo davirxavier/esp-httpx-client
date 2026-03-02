@@ -368,7 +368,6 @@ namespace ESP_HTTPX_CLIENT
             }
 
             handle = esp_tls_init();
-            // memset(&config, 0, sizeof(config));
 
             config = {
                 .cacert_buf = mode == PLAIN_HTTP || mode == HTTPS_INSECURE ? nullptr : (const unsigned char*)cert,
@@ -490,15 +489,22 @@ namespace ESP_HTTPX_CLIENT
                 if (available > 0)
                 {
                     size_t toWrite = min(available, dataBufferSize);
-                    ESP_HTTPX_LOGW(dataBuffer, toWrite);
                     ssize_t written = esp_tls_conn_write(handle, dataBuffer, toWrite);
-                    if (hasWriteError(written))
+
+                    ssize_t error = hasWriteError(written);
+                    if (error != 0)
                     {
-                        ESP_HTTPX_LOGF("Write error: %x\n", written);
+                        ESP_HTTPX_LOGF("Write error: %x\n", error);
                         callError(WRITE_ERROR);
                         return;
                     }
 
+                    if (isWriteSkip(written))
+                    {
+                        return;
+                    }
+
+                    ESP_HTTPX_LOGW(dataBuffer, toWrite);
                     size_t remaining = currentWriteLen - written;
                     if (remaining > 0)
                     {
@@ -544,10 +550,16 @@ namespace ESP_HTTPX_CLIENT
                 }
 
                 ssize_t written = esp_tls_conn_write(handle, dataBuffer + currentWriteOffset, currentWriteLen);
-                if (hasWriteError(written))
+                ssize_t error = hasWriteError(written);
+                if (error != 0)
                 {
                     ESP_HTTPX_LOGF("Write error: %x\n", written);
                     callError(WRITE_ERROR);
+                    return;
+                }
+
+                if (isWriteSkip(written))
+                {
                     return;
                 }
 
@@ -1226,12 +1238,29 @@ namespace ESP_HTTPX_CLIENT
             return writeWithTimeout((const uint8_t*) data, len, timeout);
         }
 
-        bool hasWriteError(ssize_t result) const
+        ssize_t hasWriteError(ssize_t result) const
         {
-            return result < 0 &&
+            if (result < 0 &&
+                result != -1 &&
                 result != ESP_TLS_ERR_SSL_WANT_READ &&
-                result != ESP_TLS_ERR_SSL_WANT_WRITE &&
-                (mode != PLAIN_HTTP || result != ESP_HTTPX_CLIENT_TIMEOUT);
+                result != ESP_TLS_ERR_SSL_WANT_WRITE)
+            {
+                return result;
+            }
+
+            if (result == -1 && (errno == 104 || errno == 128))
+            {
+                return errno;
+            }
+
+            return 0;
+        }
+
+        bool isWriteSkip(ssize_t result) const
+        {
+            return (mode == PLAIN_HTTP && result == ESP_HTTPX_CLIENT_TIMEOUT) ||
+                result == ESP_TLS_ERR_SSL_WANT_READ ||
+                result == ESP_TLS_ERR_SSL_WANT_WRITE;
         }
 
         ssize_t writeWithTimeout(const uint8_t *data, size_t len, unsigned long timeout = 2500)
@@ -1252,7 +1281,7 @@ namespace ESP_HTTPX_CLIENT
                     remaining -= sent;
                     timer = millis();
                 }
-                else if (hasWriteError(sent))
+                else if (hasWriteError(sent) != 0)
                 {
                     ESP_HTTPX_LOGF("Error writing to socket: 0x%x\n", -sent);
                     return sent;
