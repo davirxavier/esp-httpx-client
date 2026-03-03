@@ -619,25 +619,22 @@ namespace ESP_HTTPX_CLIENT
                     return;
                 }
 
-                if (isQueueWriteDone())
-                {
-                    resetQueueWrite();
+                resetQueueWrite();
 
-                    if (currentState == WRITING_HTTP_REQUEST)
-                    {
-                        writeHttpLine();
-                    }
-                    else if (sendingZeroChunk)
-                    {
-                        streamCursor = 0;
-                        queueWrite(END_CHUNK_MARKER, END_CHUNK_MARKER_LEN);
-                        sentZeroChunk = true;
-                    }
-                    else if (isSendingChunked())
-                    {
-                        streamCursor = 0;
-                        writeHandler(calcMaximumBodyWriteLen(), bodyWriteIndex, multipartCounter);
-                    }
+                if (currentState == WRITING_HTTP_REQUEST)
+                {
+                    writeHttpLine();
+                }
+                else if (isQueueWriteDone() && sendingZeroChunk)
+                {
+                    streamCursor = 0;
+                    queueWrite(END_CHUNK_MARKER, END_CHUNK_MARKER_LEN);
+                    sentZeroChunk = true;
+                }
+                else if (isQueueWriteDone() && isSendingChunked())
+                {
+                    streamCursor = 0;
+                    writeHandler(calcMaximumBodyWriteLen(), bodyWriteIndex, multipartCounter);
                 }
 
                 size_t available = currentWriteLen;
