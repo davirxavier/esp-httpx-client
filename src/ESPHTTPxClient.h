@@ -260,8 +260,17 @@ namespace ESP_HTTPX_CLIENT
     static const char MULTIPART_HEADER[] PROGMEM = "Content-Type: multipart/form-data; boundary=";
     static constexpr size_t MULTIPART_HEADER_LEN PROGMEM = strlen_P(MULTIPART_HEADER);
 
+    static const char MULTIPART_BOUNDARY_START[] PROGMEM = "--";
+    static constexpr size_t MULTIPART_BOUNDARY_START_LEN = strlen_P(MULTIPART_BOUNDARY_START);
+
     static const char MULTIPART_BOUNDARY_PREFIX[] PROGMEM = "------ESP32HTTPXBoundary";
     static constexpr size_t MULTIPART_BOUNDARY_PREFIX_LEN = strlen_P(MULTIPART_BOUNDARY_PREFIX);
+
+    static const char CONTENT_DISPOSITION_HEADER_MULTIPART[] PROGMEM = "Content-Disposition: form-data; name=\"";
+    static constexpr size_t CONTENT_DISPOSITION_HEADER_MULTIPART_LEN = strlen_P(CONTENT_DISPOSITION_HEADER_MULTIPART);
+
+    static const char CONTENT_DISPOSITION_HEADER_MULTIPART_2[] PROGMEM = "; filename=\"";
+    static constexpr size_t CONTENT_DISPOSITION_HEADER_MULTIPART_2_LEN = strlen_P(CONTENT_DISPOSITION_HEADER_MULTIPART_2);
 
     /**
      * Handler for client events.
@@ -426,6 +435,14 @@ namespace ESP_HTTPX_CLIENT
             queueWrite("\r\n", 2);
         }
 
+        /**
+         * Sends the headers related to content. Should always be called after all other desired headers have been sent
+         * (with sendHeader).
+         * @param length Content length to be sent. Set to ESP_HTTPX_CONTENT_CHUNKED to enable chunked transfer, or
+         * ESP_HTTPX_CONTENT_MULTIPART to enable multipart. This client only supports multipart with chunked transfer
+         * encoding.
+         * @param contentType Content type to be sent. Eg "text/plain".
+         */
         void sendContentHeaders(ssize_t length, const char *contentType = nullptr)
         {
             contentLength = length;
@@ -433,7 +450,7 @@ namespace ESP_HTTPX_CLIENT
             if (length >= 0)
             {
                 char numBuf[32]{};
-                snprintf(numBuf, sizeof(numBuf), "%lu", length);
+                snprintf(numBuf, sizeof(numBuf), "%zd", length);
                 sendHeader(CONTENT_LENGTH_HEADER, numBuf);
             }
             else
@@ -455,7 +472,7 @@ namespace ESP_HTTPX_CLIENT
                 sendHeader(CONTENT_TYPE_HEADER, contentType);
             }
 
-            queueWrite("\r\n", 2);
+            queueWrite(LINE_FEED, LINE_FEED_LEN);
         }
 
         bool isSendingChunked() const
@@ -476,6 +493,12 @@ namespace ESP_HTTPX_CLIENT
             cleanup();
         }
 
+        /**
+         * Sends the starting boundary and headers of a multipart part.
+         * @param contentType Content type for this part.
+         * @param name Form key for this part.
+         * @param filename Filename, if applicable.
+         */
         void startMultipartPart(const char *contentType, const char *name, const char *filename = nullptr)
         {
             if (!isSendingMultipart())
@@ -493,16 +516,16 @@ namespace ESP_HTTPX_CLIENT
                                  contentType);
             sendChunkStart(headersLen);
 
-            queueWrite("--", 2);
+            queueWrite(MULTIPART_BOUNDARY_START, MULTIPART_BOUNDARY_START_LEN);
             queueWrite(MULTIPART_BOUNDARY_PREFIX, MULTIPART_BOUNDARY_PREFIX_LEN);
             queueWrite(multipartBoundary, sizeof(multipartBoundary));
             queueWrite(LINE_FEED, LINE_FEED_LEN);
 
-            queueWrite("Content-Disposition: form-data; name=\"");
+            queueWrite(CONTENT_DISPOSITION_HEADER_MULTIPART, CONTENT_DISPOSITION_HEADER_MULTIPART_LEN);
             queueWrite(name);
-            queueWrite("\"");
+            queueWrite("\"", 1);
 
-            queueWrite("; filename=\"");
+            queueWrite(CONTENT_DISPOSITION_HEADER_MULTIPART_2, CONTENT_DISPOSITION_HEADER_MULTIPART_2_LEN);
             queueWrite(filename == nullptr ? "emptyfilename" : filename);
             queueWrite("\"", 1);
 
@@ -516,6 +539,10 @@ namespace ESP_HTTPX_CLIENT
             sendChunkEnd();
         }
 
+        /**
+         * Ends a multipart part.
+         * @param isLast Set to true if this is the last part of the body.
+         */
         void endMultipart(bool isLast)
         {
             if (!isSendingMultipart())
@@ -524,7 +551,7 @@ namespace ESP_HTTPX_CLIENT
             }
 
             sendChunkStart(2);
-            queueWrite("\r\n");
+            queueWrite(LINE_FEED, LINE_FEED_LEN);
             sendChunkEnd();
 
             if (isLast)
@@ -532,10 +559,10 @@ namespace ESP_HTTPX_CLIENT
                 size_t endLen = snprintf(nullptr, 0, "--%s%.*s--\r\n", MULTIPART_BOUNDARY_PREFIX, sizeof(multipartBoundary), multipartBoundary);
                 sendChunkStart(endLen);
 
-                queueWrite("--", 2);
+                queueWrite(MULTIPART_BOUNDARY_START, MULTIPART_BOUNDARY_START_LEN);
                 queueWrite(MULTIPART_BOUNDARY_PREFIX, MULTIPART_BOUNDARY_PREFIX_LEN);
                 queueWrite(multipartBoundary, sizeof(multipartBoundary));
-                queueWrite("--", 2);
+                queueWrite(MULTIPART_BOUNDARY_START, MULTIPART_BOUNDARY_START_LEN);
                 queueWrite(LINE_FEED, LINE_FEED_LEN);
 
                 sendChunkEnd();
@@ -548,6 +575,11 @@ namespace ESP_HTTPX_CLIENT
             multipartCounter++;
         }
 
+        /**
+         * Sends a chunk of body data.
+         * @param data Data to be sent.
+         * @param len Length of the data. Never send more than the bufferSize passed to the write handler callback.
+         */
         void sendBodyData(const uint8_t *data, size_t len)
         {
             sendingZeroChunk = false;
@@ -581,6 +613,12 @@ namespace ESP_HTTPX_CLIENT
 
             if (handle != nullptr && (currentState == WRITING_HTTP_REQUEST || currentState == WRITING_BODY))
             {
+                if (currentState == WRITING_BODY && contentLength == 0)
+                {
+                    setState(READING_STATUS);
+                    return;
+                }
+
                 if (isQueueWriteDone())
                 {
                     resetQueueWrite();
@@ -592,7 +630,7 @@ namespace ESP_HTTPX_CLIENT
                     else if (sendingZeroChunk)
                     {
                         streamCursor = 0;
-                        queueWrite("0\r\n\r\n", 5);
+                        queueWrite(END_CHUNK_MARKER, END_CHUNK_MARKER_LEN);
                         sentZeroChunk = true;
                     }
                     else if (isSendingChunked())
