@@ -284,9 +284,9 @@ namespace ESP_HTTPX_CLIENT
 
     /**
      * Handler for writing data to the HTTP request body.
-     * @param buffer Pointer to the client’s data buffer. Write your data here.
      * @param bufferSize Maximum number of bytes you can write to the buffer.
      * @param index The write index; prefer writing relative to this index if possible.
+     * @param multipartCounter Current multipart form element.
      * @returns The number of bytes written, or a value <= 0 to indicate no more data.
      */
     using ESPHttpxClientWriteHandler = std::function<void(size_t bufferSize, size_t index, size_t multipartCounter)>;
@@ -641,7 +641,7 @@ namespace ESP_HTTPX_CLIENT
                 size_t available = currentWriteLen;
                 if (available > 0)
                 {
-                    size_t toWrite = min(available, (unsigned) 8);// min(available, dataBufferSize);
+                    size_t toWrite = min(available, min(available, dataBufferSize));
                     ssize_t written = esp_tls_conn_write(handle, dataBuffer, toWrite);
 
                     ssize_t error = hasWriteError(written);
