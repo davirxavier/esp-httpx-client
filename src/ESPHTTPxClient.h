@@ -190,7 +190,8 @@ namespace ESP_HTTPX_CLIENT
         CONNECTION_SUCCESSFUL_EVENT,
         CONNECTION_FAILED_EVENT,
         SEND_METHOD_EVENT,
-        SEND_PATH_AND_QUERY_EVENT,
+        SEND_PATH_EVENT,
+        SEND_QUERY_EVENT,
         SEND_USER_HEADERS_EVENT,
         ERROR_EVENT,
         STATUS_RECEIVED_EVENT,
@@ -1104,10 +1105,15 @@ namespace ESP_HTTPX_CLIENT
             queueWrite(methodStr);
         }
 
+        void sendPath(const char *path)
+        {
+            sendPath(path, strlen(path));
+        }
+
         /**
          * Sends the request path.
          */
-        void sendPath(const char *path)
+        void sendPath(const char *path, size_t len)
         {
             if (path == nullptr || path[0] == 0)
             {
@@ -1120,7 +1126,7 @@ namespace ESP_HTTPX_CLIENT
                 queueWrite("/", 1);
             }
 
-            queueWrite(path, HTTPX_URL_ENCODING);
+            queueWrite(path, len, HTTPX_URL_ENCODING);
         }
 
         /**
@@ -1359,7 +1365,8 @@ namespace ESP_HTTPX_CLIENT
             callCb(SEND_METHOD_EVENT);
 
             sentFirstQueryParam = false;
-            callCb(SEND_PATH_AND_QUERY_EVENT);
+            callCb(SEND_PATH_EVENT);
+            callCb(SEND_QUERY_EVENT);
 
             queueWrite(HTTP_VER);
             queueWrite(LINE_FEED, LINE_FEED_LEN);
@@ -1548,6 +1555,15 @@ namespace ESP_HTTPX_CLIENT
                 }
             }
 
+            if (pathStart != nullptr)
+            {
+                const char *queryStart = (const char*) memchr(pathStart, '?', pathLen);
+                if (queryStart != nullptr)
+                {
+                    pathLen = queryStart - pathStart;
+                }
+            }
+
             redirectionProcessed = true;
             redirectionCount++;
 
@@ -1566,12 +1582,19 @@ namespace ESP_HTTPX_CLIENT
                 {
                     sendHostname(hostStart, hostLength);
                 }
-                else if (event == SEND_PATH_AND_QUERY_EVENT)
+                else if (event == SEND_PATH_EVENT)
                 {
                     const char *path = pathStart == nullptr ? "/" : pathStart;
                     const size_t finalPathLen = pathStart == nullptr ? 1 : pathLen;
-                    writeWithTimeout(path, finalPathLen);
-                    ESP_HTTPX_LOGW(path, finalPathLen);
+                    queueWrite(path, finalPathLen);
+                }
+                else if (event == CONNECTION_SUCCESSFUL_EVENT ||
+                        event == CONNECTION_FAILED_EVENT ||
+                        event == SEND_METHOD_EVENT ||
+                        event == SEND_QUERY_EVENT ||
+                        event == SEND_USER_HEADERS_EVENT)
+                {
+                    oldHandler(event, data, len, headerTruncated);
                 }
                 else
                 {
@@ -1694,7 +1717,11 @@ namespace ESP_HTTPX_CLIENT
             currentWriteLen = 0;
             currentWriteOffset = 0;
             sendingZeroChunk = false;
+            sentZeroChunk = false;
             receivingContentLength = 0;
+            bodyWriteIndex = 0;
+            multipartCounter = 0;
+            memset(dataBuffer, 0, dataBufferSize);
         }
 
         esp_tls_conn_state_t getTlsState() const
